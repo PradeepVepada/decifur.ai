@@ -1,0 +1,84 @@
+Nodes: The Node CSV Files (The Entities)
+
+Each row in these files represents a single entity. The PK (Primary Key) field is the most important—it must be completely unique, because it's how you will connect the edges later.
+
+1. papers.csv
+
+paper_id (Primary Key - string) e.g., "PMID:12345"
+title (string)
+year (integer)
+journal (string)
+doi (string)
+abstract (string)
+citation_count (integer)
+keywords (array/string separated by pipelines, e.g., "chemotaxis|actin")
+
+2. authors.csv
+
+author_id (Primary Key - string)
+name (string)
+affiliation (string)
+orcid (string)
+
+3. chunks.csv
+
+chunk_id (Primary Key - string) e.g., "PMID:12345_chunk_1"
+text (string - the actual 400-word paragraph)
+embedding (array of floats - skip this in CSV if it breaks formatting; adding vector embeddings is usually done via Python script directly, not CSV)
+chunk_index (integer)
+token_count (integer)
+
+4. methods.csv, topics.csv, concepts.csv, organisms.csv and so on.  Upto you(Cheng and Nan) to decide what applies 
+
+Create a CSV for each following the exact parameters from your image (e.g., methods.csv needs method_id, name, description, type).
+
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+The Edge CSV Files (The Relationships):
+
+Relationships absolutely go in separate .csv files. Every edge CSV must have a source_id column and a target_id column to tell Neo4j which nodes to connect, plus consider the possibility of any additional properties from t table.
+
+1. authored_by.csv (Connects Author to Paper)
+
+source_id (matches author_id)
+target_id (matches paper_id)
+position (string - e.g., "first", "last", "middle")
+is_corresponding (boolean/string - e.g., "true" or "false")
+
+2. has_chunk.csv (Connects Paper to Chunk)
+
+source_id (matches paper_id)
+target_id (matches chunk_id)
+chunk_index (integer - e.g., 1, 2, 3)
+section_name (string - e.g., "Methods", "Discussion")
+
+3. uses_method.csv (Connects Paper to Method)
+
+source_id (matches paper_id)
+target_id (matches method_id)
+
+context (string - a short snippet explaining how it was used)
+
+section (string - e.g., "Materials and Methods")
+
+4. collaborates_with.csv (Connects Author to Author)
+
+source_id (matches Author 1's author_id)
+target_id (matches Author 2's author_id)
+paper_count (integer)
+first_year (integer)
+last_year (integer)
+
+5. Other Edge CSVs (covers_topic.csv, cites.csv, etc.) and so on if it applies.
+
+Follow the exact same pattern: source_id, target_id, and then the properties listed in like the schema image (like relevance_score for topics, or sentiment for citations).
+
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+
+Definitions: 
+
+DOI (Digital object identifier): it is a unique string of letters, numbers, and symbols assigned to a published academic article (or any digital document) to provide a permanent, unbreakable link to its location on the internet.
+
+source_id: This is the ID of the node where the relationship starts (the tail of the arrow).
+
+target_id: This is the ID of the node where the relationship ends (the head of the arrow).
