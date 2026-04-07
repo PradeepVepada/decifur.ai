@@ -81,6 +81,7 @@ HybdRAG_bot/
 - **Tiered LLM Routing**: Cost-optimized query classification
 - **Biomedical NER**: SciSpaCy entity extraction
 - **GPU Acceleration**: Surya OCR and embeddings
+- **Makes use of Bioportal with SciSpacy for entity extraction and UMLS as fallback
 
 ---
 
