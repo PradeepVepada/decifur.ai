@@ -102,11 +102,12 @@ HybdRAG_bot/
 ### Environment Variables (.env)
 
 ```bash
-NEO4J_URI=neo4j://127.0.0.1:7687
+BIOPORTAL_API_KEY=your-bioportal-api-key
+NEO4J_URI=neo4j:// URL
 NEO4J_USER=neo4j
-NEO4J_PASSWORD=12345678
+NEO4J_PASSWORD=123456789
 MISTRAL_API_KEY=your-mistral-key
-OPENAI_API_KEY=your-openai-key  # For evaluation only
+OPENAI_API_KEY=your-openai-key  # For evaluation/llm judge only
 ```
 
 ---
