@@ -10,17 +10,17 @@
 
 ```powershell
 # 1. Setup environment
-python -m venv .venv_gpu
-.\.venv_gpu\Scripts\activate
+python -m venv .venv
+.\.venv\Scripts\activate
 pip install -r requirements.txt
 
 # 2. Ensure Neo4j Desktop is running
 
 # 3. Launch Streamlit UI (port 8506)
-.\.venv_gpu\Scripts\streamlit.exe run ui/streamlit_app.py --server.port 8506
+.\.venv\Scripts\streamlit.exe run ui/streamlit_app.py --server.port 8506
 
 # 4. Or launch CLI chatbot
-.\.venv_gpu\Scripts\python.exe chatbot.py
+.\.venv\Scripts\python.exe chatbot.py
 ```
 
 ---
