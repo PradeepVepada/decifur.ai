@@ -1,0 +1,20 @@
+[
+  {
+    "question": "What role does PTEN play in chemotaxis in Dictyostelium?",
+    "status": "error",
+    "error": "{neo4j_code: Neo.ClientError.Procedure.ProcedureCallFailed} {message: Failed to invoke procedure `db.index.vector.queryNodes`: Caused by: java.lang.IllegalArgumentException: There is no such vector schema index: chunk_vector} {gql_status: 52N37} {gql_status_description: error: procedure exception - procedure execution error. Execution of the procedure db.index.vector.queryNodes() failed.}",
+    "latency_seconds": 0.28
+  },
+  {
+    "question": "How does Ras activation relate to G-protein coupled receptor signalling?",
+    "status": "error",
+    "error": "{neo4j_code: Neo.ClientError.Procedure.ProcedureCallFailed} {message: Failed to invoke procedure `db.index.vector.queryNodes`: Caused by: java.lang.IllegalArgumentException: There is no such vector schema index: chunk_vector} {gql_status: 52N37} {gql_status_description: error: procedure exception - procedure execution error. Execution of the procedure db.index.vector.queryNodes() failed.}",
+    "latency_seconds": 0.1
+  },
+  {
+    "question": "What methodology is used to study cell polarity in the Devreotes lab?",
+    "status": "error",
+    "error": "{neo4j_code: Neo.ClientError.Procedure.ProcedureCallFailed} {message: Failed to invoke procedure `db.index.vector.queryNodes`: Caused by: java.lang.IllegalArgumentException: There is no such vector schema index: chunk_vector} {gql_status: 52N37} {gql_status_description: error: procedure exception - procedure execution error. Execution of the procedure db.index.vector.queryNodes() failed.}",
+    "latency_seconds": 0.06
+  }
+]
