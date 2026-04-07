@@ -1,0 +1,33 @@
+--extra-index-url https://download.pytorch.org/whl/cu124
+
+# Install frontend deps with: cd frontend && npm install
+# Core
+mistralai
+openai
+neo4j
+tiktoken
+python-dotenv
+
+# PDF Extraction & OCR
+pymupdf
+surya-ocr
+torch==2.6.0+cu124
+torchvision==0.21.0+cu124
+transformers==4.56.1
+huggingface-hub>=0.36.2,<1.0
+
+# Embeddings
+sentence-transformers
+
+# Biomedical NER
+scispacy
+https://s3-us-west-2.amazonaws.com/ai2-s2-scispacy/releases/v0.5.4/en_core_sci_lg-0.5.4.tar.gz
+
+# API Backend
+fastapi
+uvicorn[standard]
+sse-starlette
+
+# Streamlit Frontend
+streamlit
+typing-extensions>=4.10.0
