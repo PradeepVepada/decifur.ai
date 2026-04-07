@@ -31,10 +31,10 @@ Comprehensive documentation is available in the `Docs/` folder:
 
 | Document | Description |
 |----------|-------------|
-| [01_system_architecture.md](Docs/01_system_architecture.md) | Complete system architecture, tech stack, data flow, and Neo4j schema |
-| [02_walkthrough_status.md](Docs/02_walkthrough_status.md) | Tasks completed, in progress, and pending with status |
-| [03_ui_suggestions.md](Docs/03_ui_suggestions.md) | UI enhancement suggestions for conversational interface with chat history |
-| [04_cloud_deployment_roadmap.md](Docs/04_cloud_deployment_roadmap.md) | Cloud deployment roadmap from local to production |
+| [01_system_architecture.md](docs/01_system_architecture.md) | Complete system architecture, tech stack, data flow, and Neo4j schema |
+| [02_walkthrough_status.md](docs/02_walkthrough_status.md) | Tasks completed, in progress, and pending with status |
+| [03_ui_suggestions.md](docs/03_ui_suggestions.md) | UI enhancement suggestions for conversational interface with chat history |
+| [04_cloud_deployment_roadmap.md](docs/04_cloud_deployment_roadmap.md) | Cloud deployment roadmap from local to production |
 
 ---
 
