@@ -41,35 +41,70 @@ Comprehensive documentation is available in the `Docs/` folder:
 ## Project Structure
 
 ```
-HybdRAG_bot/
-├── Core Engine
-│   ├── rag_engine.py          # Main RAG pipeline with PCC Memory
-│   ├── graph_store.py         # Neo4j vector + graph operations
-│   ├── pcc_memory.py          # PCC Memory module
-│   └── extract.py             # PDF extraction + SciSpaCy NER
+NovaAI_v2/
 │
-├── Interfaces
-│   ├── chatbot.py             # CLI chatbot
-│   └── ui/streamlit_app.py    # Streamlit web UI
+├── core/                          # Core RAG + Memory + Graph Engine
+│   ├── rag_engine.py              # Main RAG pipeline
+│   ├── graph_store.py             # Neo4j vector + graph ops
+│   ├── pcc_memory.py              # PCC Memory module
+│   ├── extract.py                 # PDF extraction + SciSpaCy NER
+│   ├── biomedical_normalizer.py   # UMLS/BioPortal normalization
+│   ├── conversation_store.py      # Chat history + session memory
 │
-├── Ingestion
-│   └── build_index.py         # Batch ingestion pipeline
+├── interfaces/                    # User-facing interfaces
+│   ├── chatbot.py                 # CLI chatbot
+│   ├── ui/
+│   │   ├── streamlit_app.py       # Streamlit UI
+│   │   ├── components/            # UI widgets, layouts
+│   │   └── assets/                # Images, CSS, JS
 │
-├── Evaluation
-│   ├── llm_judge.py           # LLM-as-Judge evaluation
-│   └── ragas_eval.py          # RAGAS metrics
+├── ingestion/                     # Data ingestion + indexing
+│   ├── build_index.py             # Batch ingestion pipeline
+│   ├── refresh_embeddings.py      # Recompute embeddings
+│   ├── paper_ingest.py            # PDF → chunks pipeline
 │
-├── Data
-│   └── data/chunks.json       # 7,597 chunks from 226 papers
+├── evaluation/                    # Evaluation frameworks
+│   ├── llm_judge.py               # LLM-as-Judge evaluation
+│   ├── ragas_eval.py              # RAGAS metrics
+│   ├── tests/                     # Unit tests for eval
 │
-├── Docs/
+├── data/                          # Data folder (LFS recommended)
+│   ├── chunks.json                # 7,736 chunks from 230 papers
+│   ├── raw/                       # Raw PDFs
+│   ├── processed/                 # Cleaned text
+│   ├── embeddings/                # Embedding vectors
+│   └── README.md                  # Document data layout
+│
+├── docs/                          # Documentation
 │   ├── 01_system_architecture.md
 │   ├── 02_walkthrough_status.md
 │   ├── 03_ui_suggestions.md
-│   └── 04_cloud_deployment_roadmap.md
+│   ├── 04_cloud_deployment_roadmap.md
+│   └── api_reference.md
 │
+├── scripts/                       # Utility scripts
+│   ├── start_web.bat
+│   ├── start.bat
+│   ├── export_graph.py
+│   └── maintenance_tools.py
+│
+├── tests/                         # Unit tests
+│   ├── test_rag_engine.py
+│   ├── test_graph_store.py
+│   ├── test_memory.py
+│   └── test_ui.py
+│
+├── models/                        # Model configs + weights (ignored)
+│   ├── model_config.py
+│   └── bioqwen_modelfile/         #modelfile for finetuned bioqwen model
+│
+├── .env_sample                    # Template for environment variables
+├── .gitignore
+├── .gitattributes
 ├── requirements.txt
-└── .env                       # API keys (not committed)
+├── README.md
+└── api.py                         # REST API entrypoint
+
 ```
 
 ---
@@ -94,8 +129,6 @@ HybdRAG_bot/
 | RAG Pipeline | ✅ Complete |
 | PCC Memory | ✅ Complete |
 | Frontend UI | ✅ Complete |
-| Cloud Deployment | ⏳ Pending |
-
 ---
 
 ## Configuration
