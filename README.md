@@ -1,4 +1,4 @@
-# HybdRAG - Devreotes Research Explorer
+# Decifur.ai - Devreotes Research Explorer
 
 > **Conversational AI for interrogating the research corpus of Prof. Peter Devreotes (Johns Hopkins University)**  
 > **Domain:** Cell Biology → Signal Transduction & Chemotaxis  
