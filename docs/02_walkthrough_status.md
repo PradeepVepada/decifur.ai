@@ -1,144 +1,99 @@
-# HybdRAG Walkthrough & Status
-## Codebase-Aligned Operational Guide
+# HybdRAG / DAI — Walkthrough & Status
 
-> Last updated: April 2026  
-> Source of truth: current repository code (`api.py`, `rag_engine.py`, `graph_store.py`, `pcc_memory.py`, `UI/streamlit_app.py`)
+Operational guide aligned with the current codebase (`rag_engine.py`, `model_config.py`, `api.py`, `UI/streamlit_app.py`, `graph_store.py`, `pcc_memory.py`).
 
 ---
 
-## 1) Current Project State
+## 1) Project status snapshot
 
 | Area | Status | Notes |
-|---|---|---|
-| Core query pipeline | Complete | `rag_engine.py` orchestrates retrieval + generation |
-| Hybrid Neo4j retrieval | Complete | Dense + BM25 + entity boost + RRF |
-| PCC memory | Complete | Short + long-term memory wired into prompt context |
-| Streamlit UI | Complete | Streaming answers, source rendering, session controls |
-| FastAPI backend | Complete | Non-stream + SSE stream endpoints |
-| Conversation persistence | Complete | Neo4j-backed via `conversation_store.py` |
-| Evaluation scripts | Complete | `evaluation/llm_judge.py`, `evaluation/ragas_eval.py` |
-| Cloud deployment hardening | In progress | Docs/planning present, infra not fully codified |
+| --- | --- | --- |
+| Corpus RAG pipeline | Complete | Ollama generation + Neo4j hybrid retrieval + optional OpenAI deep path |
+| PCC memory | Complete | Short + long-term; hydrated from `ConversationStore` when using API |
+| Streamlit UI | Complete | Corpus vs web mode, streaming, rate limits, archive helpers |
+| FastAPI | Complete | Sync + SSE; shared engine + per-conversation hydration |
+| Incremental PDF ingest | Complete | `POST /api/papers/upload` → `engine.ingest_pdf_path` |
+| Web search mode | Complete | OpenAI summarisation (`web_search.py`), not Ollama |
+| Evaluation scripts | Complete | Under `evaluation/`; manual / offline runs |
 
 ---
 
-## 2) End-to-End Walkthrough (Runtime)
+## 2) Startup sequence
 
-### Step A: Startup
+1. **Environment:** Load `.env`. API requires `OLLAMA_BASE_URL`, `NEO4J_URI`, `NEO4J_PASSWORD`. Streamlit blocks without `OLLAMA_BASE_URL`.
+2. **`RAGEngine.load()`:** `GraphStore.load()` → SciSpaCy → optional biomedical normalizer → `create_pcc_memory` sharing the graph embedder and OpenAI-compatible client pointed at Ollama.
+3. **API lifespan:** Instantiates `ConversationStore`, async lock around the single shared engine (avoids cross-talk between concurrent requests).
 
-1. Load env vars (`MISTRAL_API_KEY`, `NEO4J_URI`, `NEO4J_PASSWORD` required for API path).
-2. Initialize `RAGEngine`.
-3. `RAGEngine.load()`:
-   - Connects to Neo4j via `GraphStore.load()`.
-   - Loads SciSpaCy model.
-   - Optionally initializes biomedical normalizer.
-   - Initializes PCC memory with shared embedder/Mistral client.
-
-### Step B: User query handling
-
-1. Query enters from one of:
-   - `UI/streamlit_app.py` (`ask_stream`)
-   - `chatbot.py` (`ask_stream`)
-   - `api.py` (`ask` or `ask_stream`)
-2. `RAGEngine._prepare_query()`:
-   - Adds user turn to short-term memory.
-   - Extracts entities locally.
-   - Optionally normalizes entities through BioPortal/UMLS.
-   - Runs retrieval + PCC context fetch in parallel.
-3. If no relevant chunks pass threshold, returns refusal message.
-4. Otherwise calls Mistral generation with grounded prompt and source tags.
-5. Stores assistant turn in memory and returns answer + source chunks + memory info.
-
-### Step C: Streaming behavior
-
-- Streaming is true token streaming from Mistral (`self.client.chat.stream(...)`).
-- Streamlit updates token-by-token.
-- FastAPI `/api/chat/stream` relays SSE events (`token`, `sources`, `memory_info`, `done`).
+**Why a single shared engine:** One Neo4j driver pool and one heavy embedder; conversations are isolated by `conversation_id` + hydration, not by separate engine instances.
 
 ---
 
-## 3) Retrieval Walkthrough
+## 3) Per-query walkthrough (corpus mode)
 
-`GraphStore.search()` performs:
+**Linear order (matches code):**
 
-1. Query embedding with `NeuML/pubmedbert-base-embeddings` (cached).
-2. Parallel calls:
-   - Neo4j vector search on `chunk_embeddings`.
-   - Neo4j fulltext BM25 search on `chunk_text`.
-3. Candidate merge.
-4. Reciprocal Rank Fusion scoring.
-5. Optional entity-match boost from graph edges.
-6. Top-k return to `rag_engine.py`.
+1. **Graph analytics shortcut** — If the question is author/gene style, `try_author_gene_graph_answer` may return early from `store.get_authors_for_molecule` (no chunk RAG).
+2. **`_prepare_query`** — PCC `add_message(user)`; rewrite follow-ups and paper-discovery queries (`REWRITE_MODEL` on Ollama); SciSpaCy NER + optional normalisation; **parallel** `store.search(retrieval_query, k, entities)` and `_get_pcc_context`.
+3. **Relevance** — Empty chunks → refusal (`REFUSAL_MESSAGE`). Low score may still proceed when paper-discovery, rewritten follow-up, or author×gene relax applies.
+4. **Branches** — **Paper discovery:** `_answer_paper_discovery_query`. **Standard:** `_resolve_generation(intent)` then `chat.completions.create` with `_rag_generation_kwargs` (Ollama `extra_body` when not using OpenAI deep).
+5. **Post** — `_strip_thinking` / citation post-processing; `_post_process` updates PCC and sliding `conversation_history`.
 
----
-
-## 4) Memory Walkthrough
-
-### Short-term memory
-- Sliding message window (`SHORT_TERM_WINDOW = 10`).
-- Compression is lazy and triggered on retrieval, not on every write.
-- Can use extractive fallback or Mistral compression.
-
-### Long-term memory
-- Stored as `MemoryEpisode` nodes with embeddings.
-- Retrieved via Neo4j vector index (`memory_episode_embeddings`).
-- Expired episodes are pruned by retention policy (`LONG_TERM_EXPIRY_DAYS = 30`).
-
-### Injection strategy
-- Memory context is inserted as dedicated background section, separate from paper context to avoid false citations.
+**Streaming:** `ask_stream` yields a heartbeat first, then runs `_prepare_query` in a thread pool so the UI does not freeze; tokens stream from the chat completion API; final yield carries chunks and `memory_info`.
 
 ---
 
-## 5) Runtime Call Pattern (Per Query)
+## 4) Retrieval walkthrough (`graph_store.py`)
 
-Typical chat query:
+1. Module-level LRU cache for query embeddings (reduces repeat cost).
+2. **Parallel** dense (`chunk_embeddings`) and BM25 (`chunk_text`).
+3. Merge candidate records; **RRF**; optional **entity boost** from chunk–entity edges.
+4. Return top-k with fused `score` (see `rag_engine.TOP_K_RETRIEVAL` / `TOP_K_PAPER_DISCOVERY`).
 
-- Mistral: `1` generation call (plus optional `+1` compression call).
-- Neo4j: multiple retrieval/memory queries (database ops, no LLM token billing).
-- BioPortal/UMLS: variable, only if normalizer is enabled and entities are found.
-- OpenAI judge: not used in normal chat path.
-
----
-
-## 6) API and Interface Surface
-
-### API (`api.py`)
-- `POST /api/chat` (non-streaming)
-- `POST /api/chat/stream` (SSE streaming)
-- conversation CRUD/search endpoints
-- memory status/clear/store endpoints
-- papers list and health endpoints
-
-### UI (`UI/streamlit_app.py`)
-- streaming chat UX
-- source display toggle
-- rate limiting/session query caps
-- local archive/load conversation controls
-
-### CLI (`chatbot.py`)
-- commands: `/papers`, `/sources`, `/memory`, `/reset`, `/help`, `/quit`
+**Why parallel dense + BM25:** Latency ≈ `max(dense, bm25) + boost` instead of summing sequential round-trips.
 
 ---
 
-## 7) Validation Checklist (Operational)
+## 5) Memory walkthrough (`pcc_memory.py`)
 
-Use this quick list after pulling latest code:
+- **Short-term:** Rolling window; compression on a fixed interval (`LLM_COMPRESS_EVERY_N`).
+- **Long-term:** Episodes with embeddings; retrieval via Neo4j vector index; pruning by age.
+- **API hydration:** `hydrate_memory_from_messages` replays stored messages when switching `conversation_id` so PCC matches server-side history.
 
-- Neo4j is up and reachable.
-- Required env vars are present.
-- `RAGEngine.load()` succeeds.
-- Query returns source-backed answer in UI.
-- `/api/health` returns healthy state.
-- Memory status endpoint returns PCC fields.
+**Why separate from paper context:** Prevents memory text from being mistaken for cited excerpts.
 
 ---
 
-## 8) Open Work / Recommended Next Pass
+## 6) API + persistence
 
-1. Formalize cloud deployment manifests and environment profiles.
-2. Add automated integration tests for stream + non-stream parity.
-3. Add budget guardrails and telemetry for external API usage.
-4. Add CI quality checks for docs drift against runtime constants.
+- **`_prepare_engine_for_conversation`:** Sets PCC conversation id and rebuilds in-memory history from Neo4j messages.
+- **Assistant save:** `Message` includes `memory_info`; if Neo4j rejects nested types, persistence logs a warning (non-fatal).
+
+Endpoints summary: health, chat, chat stream, conversations CRUD/search, memory status/clear/store, papers list, ingest status, PDF upload, gene–authors analytics.
 
 ---
 
-This document is intentionally implementation-focused and should be updated whenever retrieval, memory wiring, or endpoint behavior changes.
+## 7) Web mode (Streamlit)
+
+User toggles **web** → `web_search` pipeline (DuckDuckGo → scrape → OpenAI stream). Does not use corpus retrieval; `memory_info` typically includes `mode: web`.
+
+**Why OpenAI for web:** Keeps RunPod/Ollama for private corpus workloads and uses a small cloud model for live web summarisation.
+
+---
+
+## 8) Operational checklist
+
+- Neo4j reachable; vector + fulltext indexes built (`build_index` / ingest).
+- Ollama endpoint responds at `OLLAMA_BASE_URL` (no stray `/v1` on the env value — `model_config` strips it).
+- Test: one corpus query with sources; optional `/api/health`; optional memory status after a few turns.
+
+---
+
+## 9) Open follow-ups
+
+- Harden assistant message serialization if Neo4j property types still warn on `memory_info`.
+- Expand automated tests for stream vs non-stream parity and ingest idempotency.
+- CI check that `TOP_K_*` and env defaults stay in sync with docs.
+
+---
+
+*Last updated: April 2026.*

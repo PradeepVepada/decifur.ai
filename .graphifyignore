@@ -1,0 +1,9 @@
+# graphify corpus noise (see graphify-out/guide §6)
+node_modules/
+dist/
+vendor/
+*.generated.py
+
+# Python bytecode (large, low signal for the graph)
+__pycache__/
+*.pyc

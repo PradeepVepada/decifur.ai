@@ -1,213 +1,178 @@
-# 🧬 HybdRAG System Architecture
-## Code-Aligned Reference (Current)
+# HybdRAG / DAI — System Architecture
 
-> **Project:** Biomedical GraphRAG assistant for the Devreotes corpus  
-> **Runtime:** Python + Neo4j + Mistral + SciSpaCy  
-> **Scope:** Current architecture based on the active codebase
+## Code-aligned reference (current repo)
+
+**Product:** DAI — Data Aware Intelligence (Devreotes Research Explorer) · **Stack:** Python, Neo4j, Ollama-compatible LLM (OpenAI client), SciSpaCy, optional BioPortal/UMLS, optional OpenAI for deep reasoning and web mode.
 
 ---
 
-## 1. High-Level Architecture
+## 1. Layered model (what each layer does and why)
+
+| Layer | Responsibility | Why this approach |
+| --- | --- | --- |
+| **Presentation** | `UI/streamlit_app.py` (corpus vs web mode), `api.py` (REST + SSE), `chatbot.py` (CLI) | Same engine for all surfaces; Streamlit for demos, FastAPI for integrations, CLI for ops. |
+| **Orchestration** | `rag_engine.py` — session binding, rewrites, intent routing, parallel prep, generation, PCC hooks | One place owns the chat contract (`ask` / `ask_stream`), graph shortcuts, and refusal paths. |
+| **Retrieval** | `graph_store.py` — dense ANN + BM25, RRF, entity boost; optional `get_authors_for_molecule` | Hybrid beats either alone on biomedical phrasing; RRF is stable without tuning two score scales; graph boost uses extracted entities. |
+| **Memory** | `pcc_memory.py` — short-term window, lazy compression, long-term episodes in Neo4j | Keeps follow-ups coherent without stuffing full history into every prompt; episodic store is queryable and bounded. |
+| **Normalization** | `biomedical_normalizer.py` (optional) | Aligns surface strings to canonical concepts when API keys are present. |
+| **Ingestion** | `extract.py`, `paper_ingest.py`, `build_index.py` — PDF → chunks, embeddings, Neo4j graph | Offline/full build vs incremental upload without rebuilding the whole index. |
+| **Web (out-of-corpus)** | `web_search.py` — DuckDuckGo, scrape, OpenAI streaming | Live web uses OpenAI cloud by design (not the Ollama host) to avoid overloading RunPod and to keep latency predictable. |
+| **Config** | `model_config.py`, `.env` | Single place for Ollama base URL, model tags, and optional OpenAI for deep/web. |
+
+---
+
+## 2. End-to-end flow (single direction, top → bottom)
+
+Runtime path is intentionally linear: **client → engine → (retrieval ∥ memory) → generate → client**. Ingestion is a separate vertical pipeline that only feeds Neo4j and chunk assets.
 
 ```mermaid
-graph TB
-    subgraph Ingestion["📄 Document Ingestion"]
-        PDF["PyMuPDF + OCR Pipeline"]
-        NER["SciSpaCy NER<br/>Biomedical Extraction"]
-        EMB["Embedder<br/>NeuML/pubmedbert-base-embeddings (768d)"]
-        REL["Relationship Builder<br/>Mistral (build-time)"]
+flowchart TB
+    subgraph clients["Interfaces"]
+        ST["Streamlit\nUI/streamlit_app.py"]
+        API["FastAPI\napi.py"]
+        CLI["CLI\nchatbot.py"]
     end
 
-    subgraph Frontend["🖥️ Frontend Layer"]
-        ST["Streamlit Web App<br/>UI/streamlit_app.py"]
-        CLI["CLI Chatbot<br/>chatbot.py"]
-        API["FastAPI + SSE<br/>api.py"]
+    subgraph modes["Mode split"]
+        CORP["Corpus mode\nRAGEngine"]
+        WEB["Web mode\nweb_search.py"]
     end
 
-    subgraph Query["⚡ Query Processing Layer"]
-        ROUTER["Local Intent Router<br/>(keyword + NER heuristic)"]
-        FAST["Tier 1 · Fast<br/>mistral-small-latest"]
-        DEEP["Tier 2 · Deep<br/>mistral-large-latest"]
+    subgraph engine["Orchestration — rag_engine.py"]
+        RW["Follow-up + paper-discovery\nrewrites via Ollama model"]
+        ENT["SciSpaCy NER\n+ optional normalizer"]
+        PREP["Parallel: GraphStore.search\n+ PCC context"]
+        GATE["Relevance gate\n+ paper-discovery / author×gene relax"]
+        GEN["Chat completion\nOllama fast path · OpenAI optional for deep intent"]
     end
 
-    subgraph Retrieval["🔍 GraphRAG Retrieval Engine"]
-        VEC["Neo4j Vector Search<br/>chunk_embeddings index"]
-        BM25["Neo4j Fulltext BM25<br/>chunk_text index"]
-        KG["Entity Graph Boost<br/>Chunk-Entity traversal"]
-        FUSE["RRF Fusion + Relevance Gate"]
-        MEM["PCC Memory Context<br/>short-term + long-term episodes"]
+    subgraph store["Neo4j — graph_store.py + pcc_memory.py"]
+        VEC["Vector: chunk_embeddings"]
+        FT["Fulltext: chunk_text"]
+        KG["Paper · Chunk · Entity graph"]
+        MEM["PCC: MemoryEpisode + embeddings"]
+        CONV["ConversationStore messages"]
     end
 
-    subgraph Storage["💾 Storage Layer"]
-        NEO["Neo4j Graph Database<br/>Graph + Vector + Memory Indexes"]
+    subgraph ingest["Ingestion — offline / API upload"]
+        PDF["extract.py · PDF/OCR"]
+        IDX["build_index.py full rebuild\npaper_ingest.py incremental"]
     end
 
-    subgraph Normalize["🧪 Optional Normalization"]
-        BN["BioPortal primary<br/>UMLS fallback"]
-    end
+    ST --> CORP
+    ST --> WEB
+    API --> CORP
+    CLI --> CORP
 
-    subgraph Eval["🏛️ Offline Evaluation"]
-        GEN["Generator Output<br/>(Mistral answer)"]
-        J1["Judge · Faithfulness<br/>OpenAI gpt-4o-mini"]
-        J2["Judge · Relevance<br/>OpenAI gpt-4o-mini"]
-    end
+    CORP --> RW --> ENT --> PREP --> GATE --> GEN
+    PREP --> VEC
+    PREP --> FT
+    PREP --> KG
+    PREP --> MEM
+    GEN --> CONV
+    API --> CONV
 
-    PDF --> NER --> EMB --> REL --> NEO
-
-    ST --> ROUTER
-    CLI --> ROUTER
-    API --> ROUTER
-
-    ROUTER --> FAST
-    ROUTER --> DEEP
-
-    FAST --> VEC
-    FAST --> BM25
-    DEEP --> VEC
-    DEEP --> BM25
-
-    VEC --> FUSE
-    BM25 --> FUSE
-    KG --> FUSE
-    MEM --> FUSE
-    BN --> ROUTER
-
-    FUSE --> GEN
-    GEN --> ST
-    GEN --> CLI
-    GEN --> API
-
-    GEN -. batch eval .-> J1
-    GEN -. batch eval .-> J2
-
-    NEO <--> VEC
-    NEO <--> BM25
-    NEO <--> KG
-    NEO <--> MEM
+    PDF --> IDX --> VEC
+    IDX --> KG
 ```
 
 ---
 
-## 2. Request Lifecycle (Chat Query)
+## 3. Request lifecycle (corpus chat)
 
-1. User query arrives from `UI/streamlit_app.py`, `chatbot.py`, or `api.py`.
-2. `RAGEngine._prepare_query()` runs:
-   - Adds user turn to PCC short-term memory.
-   - Extracts entities via SciSpaCy.
-   - Optionally normalizes entities via BioPortal/UMLS.
-   - In parallel:
-     - `GraphStore.search(...)` for paper chunks.
-     - `PCCMemory` context retrieval (short + long-term).
-3. Retrieved chunks are relevance-gated.
-4. `RAGEngine` builds grounded prompt with strict citation policy.
-5. Generation call to Mistral:
-   - `mistral-small-latest` for normal queries.
-   - `mistral-large-latest` for synthesis/evolution intents.
-6. Assistant answer is stored back into PCC memory and returned with sources.
+1. **Entry:** Query from Streamlit, `POST /api/chat` or `/api/chat/stream`, or CLI. API resolves `conversation_id`, loads messages, and calls `engine.hydrate_memory_from_messages` + `set_conversation_id`.
+2. **Optional shortcut:** `try_author_gene_graph_answer` answers author–gene questions from Neo4j aggregations when the query matches.
+3. **`_prepare_query`:** PCC records the user turn; follow-up and paper-discovery rewrites run on the Ollama-compatible client; entities extracted; **retrieval and PCC context run in parallel** (`ThreadPoolExecutor`).
+4. **Gating:** If top score is below `RELEVANCE_THRESHOLD` (`0.015`), chunks may still be kept for paper-discovery, rewritten follow-ups, or author×gene relax cases (see `rag_engine.py`).
+5. **Generation:** Default path uses **Ollama** (`FAST_MODEL`); intents `cross_paper_synthesis` / `topic_evolution` use **OpenAI** `OPENAI_DEEP_MODEL` when `DEEP_REASONING_BACKEND=openai` and `OPENAI_API_KEY` is set, else same Ollama model with extra params.
+6. **Post:** Assistant turn appended; PCC may store long-term episode; API persists messages (assistant `memory_info` persistence can warn on Neo4j property constraints — see walkthrough).
+
+**Web mode:** Streamlit switches to `web_search.ask_stream_web`; no Neo4j retrieval on the hot path; summarisation uses `WEB_SEARCH_OPENAI_MODEL` (OpenAI API).
 
 ---
 
-## 3. Retrieval Design
+## 4. Hybrid retrieval (`GraphStore.search`)
 
-`graph_store.py` implements a 5-stage hybrid search:
+Stages: **embed query → (dense ∥ BM25) → merge → RRF (k=60) → entity boost → top-k**.
 
-1. Dense vector search in Neo4j (`chunk_embeddings`).
-2. BM25 fulltext search (`chunk_text` index).
-3. Candidate merge.
-4. Reciprocal Rank Fusion (RRF).
-5. Entity-graph boost from chunk-entity edges.
+| Stage | Mechanism | Why |
+| --- | --- | --- |
+| Dense | HNSW/cosine on `chunk_embeddings`, PubMedBERT 768-d | Captures paraphrase and topical similarity. |
+| Sparse | Neo4j fulltext on `chunk_text` | Handles exact gene names, methods, rare tokens. |
+| RRF | Fused ranks | No fragile score calibration between dense and BM25. |
+| Entity boost | Chunk–entity edges when NER names match | Pulls in chunks strongly tied to stated entities. |
 
-Notes:
-- Dense and BM25 run in parallel.
-- Query embedding model is `NeuML/pubmedbert-base-embeddings` (768-dim).
-- Relevant constants in `rag_engine.py`:
-  - `TOP_K_RETRIEVAL = 14`
-  - `RELEVANCE_THRESHOLD = 0.015`
+Constants in code: `TOP_K_RETRIEVAL = 8`, `TOP_K_PAPER_DISCOVERY = 16` (`rag_engine.py`); embedding model `NeuML/pubmedbert-base-embeddings` (`graph_store.py`).
 
 ---
 
-## 4. PCC Memory Architecture
+## 5. PCC memory (`pcc_memory.py`)
 
-Implemented in `pcc_memory.py` and wired from `rag_engine.py`.
-
-- **Short-term memory**
-  - Sliding window (`SHORT_TERM_WINDOW = 10`).
-  - Compression is lazy (runs on retrieval, not on every write).
-- **Long-term memory**
-  - Stored as `MemoryEpisode` nodes in Neo4j.
-  - Vector retrieval through `memory_episode_embeddings` index.
-  - Retention window: `LONG_TERM_EXPIRY_DAYS = 30`.
-- **Prompt injection**
-  - Memory is injected as dedicated context blocks, distinct from paper sources.
+| Mechanism | Settings | Why |
+| --- | --- | --- |
+| Short-term | `SHORT_TERM_WINDOW = 10`, compress every `LLM_COMPRESS_EVERY_N = 4` | Bounded context; compression avoids unbounded tokens. |
+| Long-term | Store every `STORE_EPISODE_EVERY_N = 8`, min `MIN_EPISODE_MESSAGES = 6`, expiry `LONG_TERM_EXPIRY_DAYS = 30` | Episodic memory without storing every message forever. |
+| Injection | Separate block in the user message, not cited as `[S#]` | Avoids false “paper” citations from memory. |
 
 ---
 
-## 5. LLM/External Calls by Layer
+## 6. Models by path (`model_config.py`)
 
-- **Mistral (runtime chat path)**
-  - 1 generation call per answered query.
-  - Optional extra Mistral calls for memory compression when thresholds are hit.
-- **Neo4j (runtime chat path)**
-  - Retrieval and memory vector queries (no API token billing).
-- **BioPortal/UMLS (optional)**
-  - Called only when biomedical normalizer is enabled and entities are extracted.
-- **OpenAI Judge**
-  - Used only in `evaluation/llm_judge.py`, not in normal chat flow.
+| Path | Model | Notes |
+| --- | --- | --- |
+| Chat (default), rewrites, PCC, ingest metadata/relations | `OLLAMA_MODEL` @ `OLLAMA_BASE_URL` | OpenAI-compatible `/v1` client; `extra_body` for Ollama-native params. |
+| Deep synthesis / evolution (optional) | `OPENAI_DEEP_MODEL` | Only if `DEEP_REASONING_BACKEND=openai` and key set. |
+| Web search summary | `WEB_SEARCH_OPENAI_MODEL` | OpenAI cloud, not Ollama. |
+| Evaluation judge | Configured in `evaluation/llm_judge.py` | Offline only. |
 
 ---
 
-## 6. Core Runtime Files
+## 7. Core files (quick map)
 
-- `rag_engine.py`: end-to-end orchestration and generation.
-- `graph_store.py`: Neo4j retrieval/build logic.
-- `pcc_memory.py`: short/long-term memory management.
-- `biomedical_normalizer.py`: BioPortal/UMLS normalization.
-- `api.py`: FastAPI backend + streaming endpoint.
-- `UI/streamlit_app.py`: primary UI.
-- `chatbot.py`: CLI interface.
-- `conversation_store.py`: persisted chat metadata/messages in Neo4j.
-
----
-
-## 7. Environment Configuration
-
-Required for main runtime:
-
-```bash
-MISTRAL_API_KEY=...
-NEO4J_URI=neo4j://127.0.0.1:7687
-NEO4J_PASSWORD=...
-```
-
-Optional:
-
-```bash
-NEO4J_USER=neo4j
-BIOPORTAL_API_KEY=...
-UMLS_API_KEY=...
-OPENAI_API_KEY=...   # only for evaluation/llm_judge.py
-```
+| File | Role |
+| --- | --- |
+| `rag_engine.py` | Orchestration, rewrites, retrieval prep, generation, graph analytics shortcut, `ingest_pdf_path`. |
+| `graph_store.py` | Neo4j schema, hybrid search, embedder, ingest graph build. |
+| `pcc_memory.py` | PCC short/long-term memory. |
+| `conversation_store.py` | Neo4j chat persistence for API. |
+| `extract.py` | PDF text, chunking, SciSpaCy load helper. |
+| `paper_ingest.py` | Incremental PDF → Neo4j. |
+| `build_index.py` | Full index build. |
+| `web_search.py` | Web mode pipeline. |
+| `api.py` | FastAPI app, upload ingest worker, analytics route. |
+| `model_config.py` | URLs and model IDs. |
 
 ---
 
-## 8. Ingestion / Build Path (Offline)
+## 8. API surface (`api.py`)
 
-Primary build flow:
-
-- `build_index.py` prepares chunks/metadata.
-- `graph_store.py::build()`:
-  - creates constraints/indexes,
-  - embeds chunks,
-  - discovers relationships (Mistral),
-  - writes nodes/edges in batches to Neo4j.
-
----
-
-## 9. Known Non-Goals
-
-- No automatic web search grounding in the online query path.
-- LLM judge is not a per-request safety gate; it is an offline evaluation utility.
+| Method | Path | Purpose |
+| --- | --- | --- |
+| GET | `/api/health` | Liveness |
+| POST | `/api/chat` | Sync chat |
+| POST | `/api/chat/stream` | SSE streaming |
+| POST/GET/PATCH/DELETE | `/api/conversations`… | Conversation CRUD + search |
+| GET | `/api/memory/status` | PCC snapshot |
+| POST | `/api/memory/clear`, `/api/memory/store` | Reset / force episode |
+| GET | `/api/papers` | Corpus list |
+| GET | `/api/ingest/status` | Upload job state |
+| POST | `/api/papers/upload` | PDF incremental ingest |
+| GET | `/api/analytics/gene-authors` | Gene → authors rollup |
 
 ---
 
-Last updated: April 2026
+## 9. Environment (minimal)
+
+**Required for typical runtime:** `OLLAMA_BASE_URL`, `NEO4J_URI`, `NEO4J_PASSWORD` (see `api.py` `_REQUIRED_ENV`). Streamlit also requires `OLLAMA_BASE_URL`.
+
+**Optional:** `OPENAI_API_KEY` (deep reasoning, web mode), `BIOPORTAL_API_KEY` / `UMLS_API_KEY`, `DEEP_REASONING_BACKEND`, `OLLAMA_MODEL`, embedding paths, `PDF_DIR`.
+
+---
+
+## 10. Evaluation (offline)
+
+`evaluation/evaluate_chatbot_improv.py`, `evaluation/ragas_eval.py`, `evaluation/llm_judge.py` — see `evaluation/results/` for outputs. Treat metrics as indicative; ground-truth and chunk cleanliness affect scores.
+
+---
+
+*Last updated: April 2026 — aligned with `rag_engine.py`, `model_config.py`, `graph_store.py`, `api.py`.*

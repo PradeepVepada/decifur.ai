@@ -2,8 +2,7 @@
 llm_judge.py
 ------------
 Evaluates the chatbot using LLM-as-a-Judge pattern.
-Uses OpenAI gpt-4o-mini as an independent judge (separate model family
-from the Mistral production pipeline) to avoid self-preference bias.
+Uses the Ollama-compatible endpoint from OLLAMA_BASE_URL (e.g. RunPod) as judge.
 
 Fixes applied:
   - elapsed time saved in results
@@ -27,6 +26,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from rag_engine import RAGEngine, REFUSAL_MESSAGE
+from model_config import get_ollama_base_url
 
 # ---------------------------------------------------------------------------
 # Scoring weights (named constants — not magic numbers)
@@ -92,7 +92,7 @@ def evaluate_faithfulness(client: openai.OpenAI, answer: str, context: str) -> f
         f"Context:\n{context}\n\nAnswer:\n{answer}"
     )
     res = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model=os.environ.get("OLLAMA_MODEL", "qwen35-biomedical"),
         messages=[{"role": "user", "content": prompt}],
         temperature=0,
     )
@@ -106,7 +106,7 @@ def evaluate_relevance(client: openai.OpenAI, answer: str, question: str) -> flo
         f"Question:\n{question}\n\nAnswer:\n{answer}"
     )
     res = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model=os.environ.get("OLLAMA_MODEL", "qwen35-biomedical"),
         messages=[{"role": "user", "content": prompt}],
         temperature=0,
     )
@@ -118,15 +118,16 @@ def evaluate_relevance(client: openai.OpenAI, answer: str, question: str) -> flo
 # ---------------------------------------------------------------------------
 
 def run_judge_evaluation(output_file: str = "data/judge_results.json") -> None:
+    ollama_model = os.environ.get("OLLAMA_MODEL", "qwen35-biomedical")
     print("=" * 70)
-    print("  GraphRAG — LLM-as-Judge Evaluator (OpenAI gpt-4o-mini)")
+    print(f"  GraphRAG — LLM-as-Judge Evaluator ({ollama_model} via Ollama)")
     print(f"  Faithfulness weight: {FAITHFULNESS_WEIGHT}  |  Relevance weight: {RELEVANCE_WEIGHT}")
     print(f"  Pass threshold: {PASS_THRESHOLD}")
     print("=" * 70)
 
     engine = RAGEngine()
     engine.load()
-    client = openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY", ""))
+    client = openai.OpenAI(base_url=f"{get_ollama_base_url()}/v1", api_key="ollama")
 
     results = []
 

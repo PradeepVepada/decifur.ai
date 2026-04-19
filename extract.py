@@ -13,9 +13,12 @@ Review fixes applied
       scispaCy NER (GIL prevents true threading parallelism for CPU work).
   #22 Bare except replaced with logger.exception.
   #9  print() replaced with logging.
-  Metadata cache persisted to disk so re-runs don't re-call Mistral API.
+  Metadata cache persisted to disk so re-runs don't re-call the LLM API.
 """
 
+from __future__ import annotations
+
+import hashlib
 import json
 import os
 import logging
@@ -23,17 +26,22 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from PIL import Image
 import tiktoken
-from mistralai.client import Mistral
+from openai import OpenAI
 import spacy
+
+from model_config import METADATA_MODEL, get_ollama_base_url
 import fitz  # PyMuPDF
 
 logger = logging.getLogger(__name__)
 
-# [Review #24] Read from environment variable — no more hardcoded Windows path
-PDF_DIR         = Path(os.environ.get("PDF_DIR", "data/papers"))
-OUTPUT_FILE     = Path("data/chunks.json")
-MARKER_OUT_DIR  = Path("data/marker_output")
-METADATA_CACHE_FILE = Path("data/metadata_cache.json")  # persistent cache
+# Resolve data paths from this file’s package root so cwd (e.g. Streamlit) does not matter.
+_REPO_ROOT = Path(__file__).resolve().parent
+_pdf_env = os.environ.get("PDF_DIR", "data/papers")
+_pdf_path = Path(_pdf_env)
+PDF_DIR = _pdf_path if _pdf_path.is_absolute() else (_REPO_ROOT / _pdf_path)
+OUTPUT_FILE = _REPO_ROOT / "data" / "chunks.json"
+MARKER_OUT_DIR = _REPO_ROOT / "data" / "marker_output"
+METADATA_CACHE_FILE = _REPO_ROOT / "data" / "metadata_cache.json"
 
 CHUNK_SIZE = 500
 
@@ -167,17 +175,18 @@ def _save_metadata_cache(cache: dict) -> None:
         json.dump(cache, f, indent=2, ensure_ascii=False)
 
 
-def extract_paper_metadata(pdf_filename: str, extracted_text: str, client: Mistral) -> dict:
+def extract_paper_metadata(pdf_filename: str, extracted_text: str, client: OpenAI) -> dict:
     prompt = (
         "Extract metadata from this scientific paper. Return ONLY valid JSON with:\n"
         "- title, authors (array), year (int), journal, doi (or null),\n"
+        "- pmid: PubMed ID as a string of digits only, or null if not found in the text,\n"
         "- abstract (or null), keywords (array), methods (array of {name, type}),\n"
         "- topics (3-5 key topic strings)\n\n"
         f"Filename: {pdf_filename}\n\nText (first 4000 chars):\n{extracted_text[:4000]}"
     )
     try:
-        res = client.chat.complete(
-            model="mistral-small-latest",
+        res = client.chat.completions.create(
+            model=METADATA_MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=0,
             response_format={"type": "json_object"},
@@ -187,7 +196,7 @@ def extract_paper_metadata(pdf_filename: str, extracted_text: str, client: Mistr
         logger.exception("Metadata extraction failed for %s.", pdf_filename)
         return {
             "title": pdf_filename, "authors": ["Unknown"], "year": 0,
-            "journal": "Unknown", "doi": None, "abstract": None,
+            "journal": "Unknown", "doi": None, "pmid": None, "abstract": None,
             "keywords": [], "methods": [], "topics": [],
         }
 
@@ -223,86 +232,127 @@ def extract_entities_from_chunk(nlp, text: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Single-PDF chunking (incremental ingest)
+# ---------------------------------------------------------------------------
+
+def build_chunks_for_pdf(
+    pdf_file: Path,
+    *,
+    start_chunk_id: int = 0,
+    paper_cache: dict | None = None,
+    encoder=None,
+    nlp=None,
+    client: OpenAI | None = None,
+) -> tuple[list[dict], dict]:
+    """
+    Extract, chunk, and NER-tag one PDF. Returns (chunk dicts, updated metadata cache).
+    Assigns monotonic numeric ``id`` from start_chunk_id upward.
+    """
+    pdf_file = Path(pdf_file)
+    if not pdf_file.is_file():
+        raise FileNotFoundError(str(pdf_file))
+
+    if paper_cache is None:
+        paper_cache = _load_metadata_cache()
+    if encoder is None:
+        encoder = get_encoder()
+    if nlp is None:
+        nlp = load_scispacy_model()
+    if client is None:
+        client = OpenAI(base_url=f"{get_ollama_base_url()}/v1", api_key="ollama")
+
+    MARKER_OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    filename = pdf_file.name
+    paper_id = filename.removesuffix(".pdf").removesuffix(".PDF")
+    file_sha256 = hashlib.sha256(pdf_file.read_bytes()).hexdigest().lower()
+
+    marker_path = MARKER_OUT_DIR / paper_id / f"{paper_id}.md"
+    if marker_path.exists():
+        logger.info("Loading cached OCR for %s...", filename)
+        raw_text = marker_path.read_text(encoding="utf-8")
+    else:
+        logger.info("Extracting: %s...", filename)
+        raw_text = extract_pdf_text(pdf_file)
+        if raw_text.strip():
+            marker_path.parent.mkdir(parents=True, exist_ok=True)
+            marker_path.write_text(raw_text, encoding="utf-8")
+            logger.info("Saved %d chars to marker_output.", len(raw_text))
+
+    if not raw_text.strip():
+        logger.warning("No text extracted from %s.", filename)
+        return [], paper_cache
+
+    if filename not in paper_cache:
+        logger.info("Extracting metadata for %s via OpenAI...", filename)
+        paper_cache[filename] = extract_paper_metadata(filename, raw_text, client)
+        _save_metadata_cache(paper_cache)
+
+    meta = paper_cache[filename]
+    title = (meta.get("title") or filename)[:60]
+    logger.info("Chunking '%s' (target %d tokens/chunk)...", title, CHUNK_SIZE)
+
+    spacy_chunks = chunk_text_spacy(raw_text, nlp, encoder, CHUNK_SIZE)
+    chunk_results: list[dict] = []
+    chunk_id = start_chunk_id
+
+    for i, chunk_text in enumerate(spacy_chunks):
+        if len(chunk_text) < 50:
+            continue
+        entities = extract_entities_from_chunk(nlp, chunk_text)
+        chunk_results.append({
+            "id": chunk_id,
+            "text": chunk_text,
+            "source": filename,
+            "chunk_index": i,
+            "total_chunks": len(spacy_chunks),
+            "title": meta.get("title", filename),
+            "authors": meta.get("authors", []),
+            "year": meta.get("year", 0),
+            "journal": meta.get("journal", "Unknown"),
+            "doi": meta.get("doi"),
+            "pmid": meta.get("pmid"),
+            "file_sha256": file_sha256,
+            "abstract": meta.get("abstract"),
+            "keywords": meta.get("keywords", []),
+            "methods": meta.get("methods", []),
+            "topics": meta.get("topics", []),
+            "proteins": entities["proteins"],
+            "organisms": entities["organisms"],
+            "concepts": entities["concepts"],
+        })
+        chunk_id += 1
+
+    logger.info("Produced %d semantic chunks from %s.", len(chunk_results), filename)
+    return chunk_results, paper_cache
+
+
+# ---------------------------------------------------------------------------
 # Main build function
 # ---------------------------------------------------------------------------
 
 def build_chunks() -> list[dict]:
-    all_chunks  = []
-    chunk_id    = 0
-    encoder     = get_encoder()
-    nlp         = load_scispacy_model()
-    api_key     = os.environ.get("MISTRAL_API_KEY", "")
-    client      = Mistral(api_key=api_key)
-    paper_cache = _load_metadata_cache()   # load persistent cache
+    all_chunks: list[dict] = []
+    chunk_id = 0
+    encoder = get_encoder()
+    nlp = load_scispacy_model()
+    client = OpenAI(base_url=f"{get_ollama_base_url()}/v1", api_key="ollama")
+    paper_cache = _load_metadata_cache()
 
     MARKER_OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     for pdf_file in sorted(PDF_DIR.glob("*.pdf")):
-        filename = pdf_file.name
-        paper_id = filename.removesuffix(".pdf").removesuffix(".PDF")
-
-        # Try loading cached OCR output
-        marker_path = MARKER_OUT_DIR / paper_id / f"{paper_id}.md"
-        if marker_path.exists():
-            logger.info("Loading cached OCR for %s...", filename)
-            raw_text = marker_path.read_text(encoding="utf-8")
-        else:
-            logger.info("Extracting: %s...", filename)
-            raw_text = extract_pdf_text(pdf_file)
-            if raw_text.strip():
-                marker_path.parent.mkdir(parents=True, exist_ok=True)
-                marker_path.write_text(raw_text, encoding="utf-8")
-                logger.info("Saved %d chars to marker_output.", len(raw_text))
-
-        if not raw_text.strip():
-            logger.warning("No text extracted from %s — skipping.", filename)
-            continue
-
-        # Persistent metadata cache — no repeat Mistral calls on re-runs
-        if filename not in paper_cache:
-            logger.info("Extracting metadata for %s via Mistral...", filename)
-            paper_cache[filename] = extract_paper_metadata(filename, raw_text, client)
-            _save_metadata_cache(paper_cache)
-
-        meta  = paper_cache[filename]
-        title = (meta.get("title") or filename)[:60]
-        logger.info("Chunking '%s' (target %d tokens/chunk)...", title, CHUNK_SIZE)
-
-        chunks = chunk_text_spacy(raw_text, nlp, encoder, CHUNK_SIZE)
-
-        # [Review #20] Sequential processing for CPU-bound scispaCy NER
-        # (GIL means threads give no speedup for CPU work)
-        chunk_results = []
-        for i, chunk_text in enumerate(chunks):
-            if len(chunk_text) < 50:
-                continue
-            entities = extract_entities_from_chunk(nlp, chunk_text)
-            chunk_results.append({
-                "id":           None,
-                "text":         chunk_text,
-                "source":       filename,
-                "chunk_index":  i,
-                "total_chunks": len(chunks),
-                "title":        meta.get("title", filename),
-                "authors":      meta.get("authors", []),
-                "year":         meta.get("year", 0),
-                "journal":      meta.get("journal", "Unknown"),
-                "doi":          meta.get("doi"),
-                "abstract":     meta.get("abstract"),
-                "keywords":     meta.get("keywords", []),
-                "methods":      meta.get("methods", []),
-                "topics":       meta.get("topics", []),
-                "proteins":     entities["proteins"],
-                "organisms":    entities["organisms"],
-                "concepts":     entities["concepts"],
-            })
-
-        for res in chunk_results:
-            res["id"] = chunk_id
-            all_chunks.append(res)
-            chunk_id += 1
-
-        logger.info("Produced %d semantic chunks from %s.", len(chunks), filename)
+        part, paper_cache = build_chunks_for_pdf(
+            pdf_file,
+            start_chunk_id=chunk_id,
+            paper_cache=paper_cache,
+            encoder=encoder,
+            nlp=nlp,
+            client=client,
+        )
+        all_chunks.extend(part)
+        if part:
+            chunk_id = part[-1]["id"] + 1
 
     return all_chunks
 

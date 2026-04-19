@@ -14,7 +14,7 @@ Review fixes applied
       with a stable .name property; query matches on .name not mixed _id fields.
   #4  lru_cache on instance method replaced with a module-level LRU dict
       (no self reference → no memory leak).
-  #5  build() rate-limit handling for Mistral: tenacity retry with
+  #5  build() rate-limit handling for OpenAI: tenacity retry with
       exponential backoff; max_workers=5 (was 10).
   #22 Bare except replaced with logger.exception.
   #23 Shared Neo4j driver with explicit pool configuration.
@@ -37,19 +37,75 @@ import re
 import logging
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Optional
+from typing import Any, Optional
 
-from mistralai.client import Mistral
+from openai import OpenAI
 from neo4j import GraphDatabase
 from sentence_transformers import SentenceTransformer
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
+from model_config import RELATIONSHIP_MODEL, get_ollama_base_url
 
 logger = logging.getLogger(__name__)
 
 EMBEDDING_MODEL_NAME = "NeuML/pubmedbert-base-embeddings"
 EMBEDDING_DIM        = 768
-RELATIONSHIP_MODEL   = "mistral-small-latest"
 VECTOR_INDEX_NAME    = "chunk_embeddings"   # single source of truth
+
+# ---------------------------------------------------------------------------
+# Dedup: normalized DOI / PMID (byte-level hash lives on chunks as file_sha256)
+# ---------------------------------------------------------------------------
+
+
+def normalize_doi(doi: Any) -> Optional[str]:
+    """Lowercase DOI path without URL prefix; None if empty."""
+    if doi is None:
+        return None
+    s = str(doi).strip()
+    if not s:
+        return None
+    s = s.lower()
+    for prefix in ("https://doi.org/", "http://doi.org/", "doi:"):
+        if s.startswith(prefix):
+            s = s[len(prefix) :].strip()
+            break
+    return s or None
+
+
+def normalize_pmid(pmid: Any) -> Optional[str]:
+    """Digits-only PubMed ID, or None."""
+    if pmid is None:
+        return None
+    digits = re.sub(r"\D", "", str(pmid).strip())
+    return digits if digits else None
+
+
+def _paper_meta_keys() -> tuple[str, ...]:
+    return (
+        "source",
+        "title",
+        "year",
+        "journal",
+        "doi",
+        "doi_normalized",
+        "abstract",
+        "keywords",
+        "authors",
+        "topics",
+        "methods",
+        "file_sha256",
+        "pmid",
+    )
+
+
+def _distinct_paper_row(chunk: dict) -> dict:
+    """One row per paper for MERGE/SET from any chunk of that paper."""
+    dn = normalize_doi(chunk.get("doi"))
+    return {k: chunk.get(k) for k in _paper_meta_keys()} | {
+        "doi_normalized": dn,
+        "pmid": normalize_pmid(chunk.get("pmid")),
+    }
+
 
 # ---------------------------------------------------------------------------
 # Module-level query embedding cache  [Review #4 — no instance method lru_cache]
@@ -97,10 +153,7 @@ class GraphStore:
             connection_acquisition_timeout=10.0,
         )
 
-        mistral_key = os.environ.get("MISTRAL_API_KEY")
-        if not mistral_key:
-            raise EnvironmentError("MISTRAL_API_KEY is not set.")   # [Review #15]
-        self.client = Mistral(api_key=mistral_key)
+        self.client = OpenAI(base_url=f"{get_ollama_base_url()}/v1", api_key="ollama")
 
         logger.info("Loading SentenceTransformer (%s, %d-dim)...", EMBEDDING_MODEL_NAME, EMBEDDING_DIM)
         self.embedder = SentenceTransformer(EMBEDDING_MODEL_NAME, device="cpu")
@@ -161,7 +214,7 @@ class GraphStore:
         """Lucene full-text BM25 search. Special chars escaped to avoid parse errors."""
         escaped = re.sub(r'([+\-!(){}\[\]^"~*?:\\/])', r'\\\1', query)
         cypher  = """
-            CALL db.index.fulltext.queryNodes('chunk_text', $query)
+            CALL db.index.fulltext.queryNodes('chunk_text', $search_query)
             YIELD node AS c, score AS bm25_score
             MATCH (p:Paper)-[:HAS_CHUNK]->(c)
             OPTIONAL MATCH (a:Author)-[:AUTHORED_BY]->(p)
@@ -182,7 +235,7 @@ class GraphStore:
         """
         try:
             with self.driver.session() as session:
-                return session.run(cypher, query=escaped, top_k=top_k).data()
+                return session.run(cypher, search_query=escaped, top_k=top_k).data()
         except Exception:
             logger.exception("BM25 search failed.")
             return []
@@ -214,7 +267,7 @@ class GraphStore:
     # Platinum Hybrid Search — parallelised  [Review #1, new req #1]
     # -----------------------------------------------------------------------
 
-    def search(self, query: str, k: int = 5, umls_entities: list = None) -> list:
+    def search(self, query: str, k: int = 12, umls_entities: list = None) -> list:
         """
         5-stage Platinum Hybrid Search:
           Stage 1 — Dense (ANN/HNSW vector)    ┐ now PARALLEL
@@ -315,6 +368,16 @@ class GraphStore:
                 "CREATE CONSTRAINT topic_id    IF NOT EXISTS FOR (t:Topic)    REQUIRE t.topic_id    IS UNIQUE",
             ]:
                 session.run(stmt)
+            for stmt in [
+                "CREATE CONSTRAINT paper_file_sha256 IF NOT EXISTS FOR (p:Paper) REQUIRE p.file_sha256 IS UNIQUE",
+                "CREATE CONSTRAINT paper_doi_normalized IF NOT EXISTS FOR (p:Paper) REQUIRE p.doi_normalized IS UNIQUE",
+                "CREATE CONSTRAINT paper_pmid IF NOT EXISTS FOR (p:Paper) REQUIRE p.pmid IS UNIQUE",
+            ]:
+                try:
+                    session.run(stmt)
+                except Exception:
+                    logger.exception("Optional Paper dedup constraint skipped (may already exist or conflict): %s", stmt[:70])
+
             self._create_vector_index(session)
 
     def _verify_vector_index(self):
@@ -347,7 +410,7 @@ class GraphStore:
             "Only include scientifically meaningful relationships clearly in the text."
         )
         try:
-            res = self.client.chat.complete(
+            res = self.client.chat.completions.create(
                 model=RELATIONSHIP_MODEL,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0,
@@ -390,18 +453,16 @@ class GraphStore:
             chunks = list(ex.map(_build_chunk, enumerate(chunks)))
 
         # Ingest to Neo4j using explicit transactions  [Review #2]
-        distinct_papers = {
-            c["source"]: {k: c.get(k) for k in
-                ("source","title","year","journal","doi","abstract","keywords","authors","topics","methods")}
-            for c in chunks
-        }
+        distinct_papers = {c["source"]: _distinct_paper_row(c) for c in chunks}
 
         def _write_papers(tx, papers):
             for p_id, p_meta in papers.items():
                 tx.run("""
                     MERGE (p:Paper {paper_id: $source})
                     SET p.title=$title, p.year=$year, p.journal=$journal,
-                        p.doi=$doi, p.abstract=$abstract, p.keywords=$keywords
+                        p.doi=$doi, p.doi_normalized=$doi_normalized,
+                        p.abstract=$abstract, p.keywords=$keywords,
+                        p.pmid=$pmid, p.file_sha256=$file_sha256
                 """, **p_meta)
                 tx.run("""
                     UNWIND $authors AS author_name
@@ -495,6 +556,324 @@ class GraphStore:
 
         self._built = True
         logger.info("Neo4j Knowledge Graph built.")
+
+    # -----------------------------------------------------------------------
+    # Incremental ingest (single PDF batch — MERGE into existing KG)
+    # -----------------------------------------------------------------------
+
+    def paper_exists(self, paper_id: str) -> bool:
+        """True if a Paper node with this paper_id (usually PDF filename) exists."""
+        try:
+            with self.driver.session() as session:
+                row = session.run(
+                    "MATCH (p:Paper {paper_id: $pid}) RETURN 1 AS ok LIMIT 1",
+                    pid=paper_id,
+                ).single()
+                return row is not None
+        except Exception:
+            logger.exception("paper_exists check failed.")
+            return False
+
+    def find_paper_id_by_file_hash(self, file_sha256: str) -> Optional[str]:
+        """Return ``paper_id`` if a Paper with this SHA-256 already exists."""
+        h = (file_sha256 or "").strip().lower()
+        if not h:
+            return None
+        try:
+            with self.driver.session() as session:
+                row = session.run(
+                    "MATCH (p:Paper {file_sha256: $h}) RETURN p.paper_id AS pid LIMIT 1",
+                    h=h,
+                ).single()
+                return row["pid"] if row else None
+        except Exception:
+            logger.exception("find_paper_id_by_file_hash failed.")
+            return None
+
+    def find_paper_id_by_pmid(self, pmid: str) -> Optional[str]:
+        p = normalize_pmid(pmid)
+        if not p:
+            return None
+        try:
+            with self.driver.session() as session:
+                row = session.run(
+                    "MATCH (p:Paper {pmid: $p}) RETURN p.paper_id AS pid LIMIT 1",
+                    p=p,
+                ).single()
+                return row["pid"] if row else None
+        except Exception:
+            logger.exception("find_paper_id_by_pmid failed.")
+            return None
+
+    def find_paper_id_by_normalized_doi(
+        self, doi_normalized: Optional[str], raw_doi: Any = None
+    ) -> Optional[str]:
+        """Match ``doi_normalized`` or legacy ``p.doi`` string."""
+        dn = doi_normalized or normalize_doi(raw_doi)
+        if not dn:
+            return None
+        try:
+            with self.driver.session() as session:
+                row = session.run(
+                    """
+                    MATCH (p:Paper)
+                    WHERE p.doi_normalized = $dn
+                       OR ($dn <> '' AND trim(replace(replace(replace(
+                            toLower(toString(COALESCE(p.doi, ''))),
+                            'https://doi.org/', ''), 'http://doi.org/', ''), 'doi:', '')) = $dn)
+                    RETURN p.paper_id AS pid LIMIT 1
+                    """,
+                    dn=dn,
+                ).single()
+                if row:
+                    return row["pid"]
+                if raw_doi is not None and str(raw_doi).strip():
+                    row = session.run(
+                        "MATCH (p:Paper) WHERE p.doi = $r RETURN p.paper_id AS pid LIMIT 1",
+                        r=str(raw_doi).strip(),
+                    ).single()
+                    return row["pid"] if row else None
+        except Exception:
+            logger.exception("find_paper_id_by_normalized_doi failed.")
+        return None
+
+    def validate_incremental_paper_identity(self, chunks: list) -> None:
+        """
+        Reject ingest if ``paper_id``, file hash, DOI, or PMID already exists on another paper.
+
+        Raises ValueError with a user-facing message.
+        """
+        if not chunks:
+            return
+
+        by_source: dict[str, dict] = {}
+        for c in chunks:
+            sid = c.get("source")
+            if sid and sid not in by_source:
+                by_source[sid] = c
+
+        for sid, meta in by_source.items():
+            if self.paper_exists(sid):
+                raise ValueError(f'The corpus already includes "{sid}".')
+
+            sha = (meta.get("file_sha256") or "").strip().lower()
+            if sha:
+                other = self.find_paper_id_by_file_hash(sha)
+                if other:
+                    raise ValueError(
+                        f'This file is already indexed as "{other}" (same content).'
+                    )
+
+            other = self.find_paper_id_by_normalized_doi(None, meta.get("doi"))
+            if other:
+                raise ValueError(
+                    f'A paper with this DOI is already in the corpus: "{other}".'
+                )
+
+            pm = normalize_pmid(meta.get("pmid"))
+            if pm:
+                other = self.find_paper_id_by_pmid(pm)
+                if other:
+                    raise ValueError(
+                        f'A paper with this PMID is already in the corpus: "{other}".'
+                    )
+
+    def ingest_chunk_batch(self, chunks: list) -> None:
+        """
+        Embed, run relationship discovery, and MERGE papers/chunks/entities for new chunks.
+        Indexes are created if missing (idempotent). Safe to call after load().
+
+        Raises ValueError if the paper id, file hash, DOI, or PMID duplicates existing data.
+        """
+        if not chunks:
+            return
+
+        self.validate_incremental_paper_identity(chunks)
+
+        self._setup_indexes()
+        self._verify_vector_index()
+
+        texts = [c["text"] for c in chunks]
+        logger.info("Incremental ingest: embedding %d chunk(s)...", len(chunks))
+        embeddings = self.embedder.encode(texts, show_progress_bar=False, batch_size=64)
+        for i, chunk in enumerate(chunks):
+            chunk["embedding"] = (
+                embeddings[i].tolist() if hasattr(embeddings[i], "tolist") else list(embeddings[i])
+            )
+
+        def _build_chunk(idx_chunk):
+            idx, chunk = idx_chunk
+            all_ents = chunk.get("proteins", []) + chunk.get("organisms", []) + chunk.get("concepts", [])
+            rels = self._discover_entity_relationships(chunk["text"], all_ents) if len(all_ents) >= 2 else []
+            chunk["relationships"] = rels[:5]
+            return chunk
+
+        with ThreadPoolExecutor(max_workers=5, thread_name_prefix="rel_ingest") as ex:
+            chunks = list(ex.map(_build_chunk, enumerate(chunks)))
+
+        distinct_papers = {c["source"]: _distinct_paper_row(c) for c in chunks}
+
+        def _write_papers(tx, papers):
+            for p_id, p_meta in papers.items():
+                tx.run("""
+                    MERGE (p:Paper {paper_id: $source})
+                    SET p.title=$title, p.year=$year, p.journal=$journal,
+                        p.doi=$doi, p.doi_normalized=$doi_normalized,
+                        p.abstract=$abstract, p.keywords=$keywords,
+                        p.pmid=$pmid, p.file_sha256=$file_sha256
+                """, **p_meta)
+                tx.run("""
+                    UNWIND $authors AS author_name
+                    MERGE (a:Author {author_id: toLower(replace(replace(author_name,' ','_'),',',''))})
+                    ON CREATE SET a.name = author_name
+                    WITH a MATCH (p:Paper {paper_id: $source})
+                    MERGE (a)-[:AUTHORED_BY]->(p)
+                """, source=p_id, authors=p_meta.get("authors") or [])
+                tx.run("""
+                    UNWIND $topics AS topic_name
+                    MERGE (t:Topic {topic_id: toLower(replace(topic_name,' ','-'))})
+                    ON CREATE SET t.name = topic_name
+                    WITH t MATCH (p:Paper {paper_id: $source})
+                    MERGE (p)-[:COVERS_TOPIC]->(t)
+                """, source=p_id, topics=p_meta.get("topics") or [])
+                tx.run("""
+                    UNWIND $methods AS method_obj
+                    MERGE (me:Method {method_id: toLower(replace(method_obj.name,' ','_'))})
+                    ON CREATE SET me.name=method_obj.name, me.type=method_obj.type
+                    WITH me MATCH (p:Paper {paper_id: $source})
+                    MERGE (p)-[:USES_METHOD]->(me)
+                """, source=p_id, methods=p_meta.get("methods") or [])
+
+        with self.driver.session() as session:
+            session.execute_write(_write_papers, distinct_papers)
+
+        for b in chunks:
+            b["node_id"] = f"{b['source']}_chunk_{b['chunk_index']}"
+
+        def _write_chunks(tx, batch):
+            tx.run("""
+                UNWIND $batch AS c
+                MATCH (p:Paper {paper_id: c.source})
+                MERGE (ch:Chunk {chunk_id: c.node_id})
+                SET ch.text=c.text, ch.chunk_index=c.chunk_index,
+                    ch.total_chunks=c.total_chunks, ch.embedding=c.embedding
+                MERGE (p)-[:HAS_CHUNK {chunk_index: c.chunk_index}]->(ch)
+            """, batch=batch)
+
+            tx.run("""
+                UNWIND $batch AS c UNWIND c.proteins AS ent
+                MERGE (pr:Molecule {molecule_id: ent.name})
+                ON CREATE SET pr.name=ent.name, pr.type=ent.type
+                WITH pr, c MATCH (ch:Chunk {chunk_id: c.node_id})
+                MERGE (ch)-[:STUDIES_MOLECULE]->(pr)
+            """, batch=batch)
+
+            tx.run("""
+                UNWIND $batch AS c UNWIND c.organisms AS ent
+                MERGE (o:Organism {organism_id: ent.name})
+                ON CREATE SET o.name=ent.name, o.taxonomy=ent.type
+                WITH o, c MATCH (ch:Chunk {chunk_id: c.node_id})
+                MERGE (ch)-[:STUDIES_ORGANISM]->(o)
+            """, batch=batch)
+
+            tx.run("""
+                UNWIND $batch AS c UNWIND c.concepts AS ent
+                MERGE (co:Concept {concept_id: ent.name})
+                ON CREATE SET co.name=ent.name, co.definition=ent.type
+                WITH co, c MATCH (ch:Chunk {chunk_id: c.node_id})
+                MERGE (ch)-[:DISCUSSES_CONCEPT]->(co)
+            """, batch=batch)
+
+            batch_rels = []
+            for b in batch:
+                all_ents = b.get("proteins", []) + b.get("organisms", []) + b.get("concepts", [])
+                names = {e["name"] for e in all_ents}
+                for rel in b.get("relationships", []):
+                    src = rel.get("source")
+                    tgt = rel.get("target")
+                    if src in names and tgt in names:
+                        batch_rels.append({
+                            "src": src, "tgt": tgt,
+                            "relation": rel.get("relation", "RELATED_TO"),
+                            "chunk_id": b["node_id"],
+                        })
+            if batch_rels:
+                tx.run("""
+                    UNWIND $rels AS r
+                    MATCH (e1) WHERE e1.name = r.src
+                    MATCH (e2) WHERE e2.name = r.tgt
+                    MERGE (e1)-[rel:RELATED_TO {type: r.relation, source_chunk: r.chunk_id}]->(e2)
+                """, rels=batch_rels)
+
+        with self.driver.session() as session:
+            session.execute_write(_write_chunks, chunks)
+
+        self._built = True
+        logger.info("Incremental ingest finished (%d chunks).", len(chunks))
+
+    # -----------------------------------------------------------------------
+    # Graph analytics: authors linked to a molecule / gene in the corpus
+    # -----------------------------------------------------------------------
+
+    def get_authors_for_molecule(self, gene_query: str, limit_rows: int = 500) -> dict:
+        """
+        Aggregate authors and papers that mention the molecule via STUDIES_MOLECULE.
+        gene_query is typically a gene symbol or normalized name from the query.
+        """
+        q = (gene_query or "").strip()
+        if not q:
+            return {"gene": gene_query, "authors": [], "papers": [], "author_count": 0, "paper_count": 0}
+
+        cypher = """
+            MATCH (m:Molecule)
+            WHERE coalesce(m.molecule_id, m.name, '') = $q
+               OR coalesce(m.name, m.molecule_id, '') = $q
+               OR toLower(coalesce(m.molecule_id, m.name, '')) = toLower($q)
+            WITH collect(DISTINCT m) AS ms
+            UNWIND ms AS m
+            MATCH (m)<-[:STUDIES_MOLECULE]-(:Chunk)<-[:HAS_CHUNK]-(p:Paper)
+            MATCH (a:Author)-[:AUTHORED_BY]->(p)
+            RETURN DISTINCT a.name AS author, p.paper_id AS source, p.title AS title, p.year AS year
+            ORDER BY author, year
+            LIMIT $lim
+        """
+        try:
+            with self.driver.session() as session:
+                rows = session.run(cypher, q=q, lim=int(limit_rows)).data()
+        except Exception:
+            logger.exception("get_authors_for_molecule failed for %r.", gene_query)
+            return {"gene": gene_query, "authors": [], "papers": [], "author_count": 0, "paper_count": 0}
+
+        by_author: dict[str, list[dict]] = {}
+        papers_key: set = set()
+        paper_list: list[dict] = []
+
+        for r in rows:
+            author = r.get("author") or ""
+            source = r.get("source") or ""
+            title = r.get("title") or source
+            year = r.get("year")
+            if not source:
+                continue
+            pk = (source, title, year)
+            if pk not in papers_key:
+                papers_key.add(pk)
+                paper_list.append({"source": source, "title": title, "year": year})
+
+            if author:
+                if author not in by_author:
+                    by_author[author] = []
+                if not any(x.get("source") == source for x in by_author[author]):
+                    by_author[author].append({"source": source, "title": title, "year": year})
+
+        author_names = sorted(by_author.keys())
+        return {
+            "gene": q,
+            "authors": [{"name": nm, "papers": by_author[nm]} for nm in author_names],
+            "papers": paper_list,
+            "author_count": len(author_names),
+            "paper_count": len(paper_list),
+        }
 
     # -----------------------------------------------------------------------
     # Paper listing

@@ -2,7 +2,6 @@
 
 # Install frontend deps with: cd frontend && npm install
 # Core
-mistralai
 openai
 neo4j
 tiktoken
@@ -25,9 +24,18 @@ https://s3-us-west-2.amazonaws.com/ai2-s2-scispacy/releases/v0.5.4/en_core_sci_l
 
 # API Backend
 fastapi
+python-multipart>=0.0.9
 uvicorn[standard]
 sse-starlette
 
 # Streamlit Frontend
 streamlit
 typing-extensions>=4.10.0
+
+# Web search
+ddgs>=1.0
+trafilatura>=2.0
+httpx>=0.28
+
+# Tests (optional): pip install pytest
+pytest>=8.0

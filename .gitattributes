@@ -1,0 +1,13 @@
+# Normalize line endings
+* text=auto
+
+# Use Git LFS for large data files
+*.json filter=lfs diff=lfs merge=lfs
+*.csv filter=lfs diff=lfs merge=lfs
+*.parquet filter=lfs diff=lfs merge=lfs
+*.pkl filter=lfs diff=lfs merge=lfs
+*.bin filter=lfs diff=lfs merge=lfs
+*.npy filter=lfs diff=lfs merge=lfs
+*.npz filter=lfs diff=lfs merge=lfs
+*.pt filter=lfs diff=lfs merge=lfs
+*.onnx filter=lfs diff=lfs merge=lfs

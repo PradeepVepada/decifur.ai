@@ -195,9 +195,11 @@ def main():
 
             for token, c, m in engine.ask_stream(user_input):
                 if token is not None:
-                    # Real Mistral streaming token
-                    print(token, end="", flush=True)
-                    answer += token
+                    if isinstance(m, dict) and m.get("replace_full"):
+                        answer = token
+                    else:
+                        print(token, end="", flush=True)
+                        answer += token
                 elif c is not None:
                     # Final sentinel: (None, chunks, memory_info)
                     chunks      = c or []

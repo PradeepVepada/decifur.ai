@@ -2,61 +2,76 @@
 
 > **Project:** Conversational AI for interrogating the research corpus of Prof. Peter Devreotes (Johns Hopkins University)
 > **Domain:** Cell Biology → Signal Transduction & Chemotaxis
-> **Approach:** Hybrid GraphRAG with Neo4j, SciSpaCy, Mistral AI, and Surya OCR
+> **Approach:** Hybrid GraphRAG with Neo4j, SciSpaCy, Ollama-compatible LLM (OpenAI client), optional OpenAI for deep/web modes, and Surya OCR
 
 ---
 
 ## 1. System Overview
 
+Runtime path is **linear**: clients → **RAGEngine** (rewrites → NER → hybrid retrieval ∥ PCC → gate → generate) → Neo4j. **Ingestion** is a separate vertical pipeline. **LLM-as-judge** runs only in offline evaluation scripts, not in live chat.
+
 ```mermaid
-graph TB
-    subgraph Frontend["🖥️ Frontend Layer"]
-        UI["Streamlit Web App"]
+flowchart TB
+    subgraph Frontend["🖥️ Frontend & APIs"]
+        UI["Streamlit\nUI/streamlit_app.py"]
+        API["FastAPI\napi.py"]
+        CLI["CLI\nchatbot.py"]
     end
 
-    subgraph QueryEngine["⚡ Query Processing Layer"]
-        QR["Query Router<br/>(Mistral-Small)"]
-        FAST["Tier 1 · Fast<br/>Mistral-Small"]
-        STD["Tier 2 · Standard<br/>Mistral-Medium"]
-        DEEP["Tier 3 · Deep Reasoning<br/>Mistral-Large"]
+    subgraph Modes["Query mode"]
+        CORP["Corpus · RAGEngine"]
+        WEB["Web · web_search.py\n(OpenAI summarise)"]
     end
 
-    subgraph GraphRAG["🔍 GraphRAG Retrieval Engine"]
-        VEC["Neo4j Vector Index<br/>768-dim embeddings<br/>Cosine similarity search"]
-        KG["Neo4j Knowledge Graph<br/>Entity & relationship nodes<br/>Cypher path traversal"]
-        FUSE["Context Fusion & Dedup"]
+    subgraph QueryEngine["⚡ Query processing · rag_engine.py"]
+        RW["Follow-up + paper-discovery rewrites\n(Ollama model)"]
+        NER["SciSpaCy NER · optional BioPortal/UMLS"]
+        PREP["Parallel: GraphStore.search + PCC context"]
+        GATE["Relevance gate · paper-discovery / author×gene relax"]
+        GEN["Chat completion\nOllama default · OpenAI optional for deep intent"]
     end
 
-    subgraph Evaluation["🏛️ LLM Council — Independent Evaluation"]
-        GEN["Generator<br/>(Mistral)"]
-        J1["Judge 1 · Faithfulness<br/>(OpenAI gpt-4o-mini)<br/>Does it reflect only context?"]
-        J2["Judge 2 · Relevance<br/>(OpenAI gpt-4o-mini)<br/>Does it answer the question?"]
+    subgraph GraphRAG["🔍 Hybrid retrieval · graph_store.py"]
+        VEC["Dense ANN · chunk_embeddings\nPubMedBERT 768-d"]
+        FT["BM25 fulltext · chunk_text"]
+        FUSE["RRF merge + entity-graph boost"]
     end
 
-    subgraph Ingestion["📄 Document Ingestion Pipeline"]
-        PDF["PyMuPDF + Surya OCR<br/>(GPU Accelerated)"]
-        META["LLM Metadata<br/>(Mistral)"]
-        NLP["SciSpaCy NER<br/>Biomedical Extraction"]
-        EMBED["Embedder<br/>all-mpnet-base-v2 (GPU)"]
-        REL["Relationship Builder<br/>Mistral Entity Relations"]
+    subgraph Storage["💾 Neo4j"]
+        NEO["Graph schema + vector + fulltext"]
+        MEM["PCC MemoryEpisode · conversation messages"]
     end
 
-    subgraph Storage["💾 Storage Layer"]
-        NEO["Neo4j Graph Database<br/>Graph + Vector Index"]
+    subgraph Evaluation["🏛️ Offline evaluation only"]
+        J1["evaluation/llm_judge.py\nFaithfulness"]
+        J2["Same script · Relevance"]
     end
 
-    UI --> QR
-    QR --> FAST
-    QR --> STD
-    QR --> DEEP
-    FAST & STD & DEEP --> VEC & KG
+    subgraph Ingestion["📄 Document ingestion"]
+        PDF["extract.py · PyMuPDF + Surya OCR"]
+        META["LLM metadata + relationships\n(Ollama · model_config)"]
+        NLP["SciSpaCy NER"]
+        EMBED["NeuML/pubmedbert-base-embeddings"]
+        IDX["build_index.py · paper_ingest.py"]
+    end
+
+    UI --> CORP
+    UI --> WEB
+    API --> CORP
+    CLI --> CORP
+
+    CORP --> RW --> NER --> PREP --> GATE --> GEN
+    PREP --> VEC
+    PREP --> FT
     VEC --> FUSE
-    KG --> FUSE
-    FUSE --> GEN
-    GEN --> J1 & J2
-    J1 & J2 -->|verdict score| UI
-    PDF --> META --> NLP --> EMBED --> REL --> NEO
-    NEO <--> GraphRAG
+    FT --> FUSE
+    PREP --> NEO
+    GEN --> MEM
+    API --> MEM
+
+    PDF --> META --> NLP --> EMBED --> IDX --> NEO
+    CORP -.->|batch scripts| J1
+    J1 --> J2
 ```
 
 ---
@@ -66,16 +81,18 @@ graph TB
 | Layer | Technology | Purpose |
 |---|---|---|
 | **Language** | Python 3 | Core runtime |
-| **Frontend** | Streamlit | Chat UI |
-| **Graph Database** | Neo4j Desktop | Knowledge Graph and Vector store |
-| **Vector Embeddings** | `SentenceTransformers` (`all-mpnet-base-v2`) | Local, GPU-accelerated chunk embeddings (768-dim) |
+| **Frontend** | Streamlit (`UI/streamlit_app.py`) | Chat UI (corpus vs web mode) |
+| **API** | FastAPI (`api.py`) | REST + SSE, conversations, upload ingest |
+| **Graph Database** | Neo4j | Knowledge graph, vector index, fulltext index, PCC + conversation storage |
+| **Vector Embeddings** | `SentenceTransformers` (`NeuML/pubmedbert-base-embeddings`, 768-dim) | Chunk + query embeddings aligned with biomedical literature |
 | **Scientific NER** | SciSpaCy (`en_core_sci_lg`) | Fast biological entity extraction (proteins, organisms, concepts) |
-| **Primary LLM** | Mistral AI (`small`, `medium`, `large` latest) | Intent routing, metadata generation, relationship discovery, answer generation. |
-| **Evaluation LLM** | OpenAI API (`gpt-4o-mini`) | Independent judge scoring to prevent self-preference bias. |
-| **PDF Processing** | PyMuPDF + Surya OCR | High-accuracy text extraction with GPU OCR fallback for scanned papers. |
+| **Primary LLM** | Ollama-compatible endpoint (`OLLAMA_BASE_URL`, `OLLAMA_MODEL` via OpenAI client `/v1`) | Rewrites, PCC, ingest metadata/relationships, default answer generation (`model_config.py`). |
+| **Optional LLM** | OpenAI API | Deep synthesis / topic evolution when `DEEP_REASONING_BACKEND=openai`; web search summarisation (`WEB_SEARCH_OPENAI_MODEL`). |
+| **Evaluation** | `evaluation/llm_judge.py` | Offline faithfulness + relevance scores (judge uses configured Ollama model — not on the live request path). |
+| **PDF Processing** | PyMuPDF + Surya OCR | High-accuracy text extraction with OCR fallback for scanned papers. |
 
 > [!TIP]
-> **Independent Judging matters!** Evaluator scores (Faithfulness and Relevance) are processed by OpenAI API to ensure that Mistral does not exhibit self-preference bias when judging its own output. 
+> **Independent judging (offline):** `llm_judge.py` scores answers against context and the question so the generator is not the only grader. Run it as a batch script; it does not gate production traffic.
 
 ---
 
@@ -138,8 +155,8 @@ erDiagram
 ```
 
 ### Key Highlights
-- **Dynamic relationships**: `RELATED_TO` edges are synthesized by the LLM (Mistral) from extracted biomedical entities representing actual scientific mechanisms (e.g., `REGULATES`, `LOCATED_IN`).
-- **Unified Graph + Vectors**: Semantic search executes inside Neo4j alongside Cypher graph hops.
+- **Dynamic relationships**: Relationship extraction during ingest uses the configured Ollama model (`RELATIONSHIP_MODEL` in `model_config.py`) from extracted biomedical entities.
+- **Unified Graph + Vectors**: Hybrid retrieval runs dense vector + BM25 fulltext inside Neo4j, then RRF and entity-graph boost — not a separate “fusion service.”
 
 ---
 
@@ -157,8 +174,8 @@ The pipeline processes massive digital or scanned datasets asynchronously scalin
 2. **Organism:** Species and cellular systems (e.g. Dictyostelium).
 3. **Concept:** Diseases, general cellular mechanisms, tissues. 
 
-### 4.3 Graph Construction via Mistral
-During batch ingestion (`build_index.py`), chunks are sent asynchronously via Threadpools to `mistral-small-latest` to map out the explicit mechanistic relations:
+### 4.3 Graph construction via LLM
+During batch ingestion (`build_index.py`), chunks are processed with the configured **Ollama** model (see `graph_store.py` / `model_config.RELATIONSHIP_MODEL`) to map explicit mechanistic relations:
 ```json
 {
   "relationships": [
@@ -172,84 +189,81 @@ During batch ingestion (`build_index.py`), chunks are sent asynchronously via Th
 
 ## 5. Query Processing Pipeline
 
-### 5.1 Intelligent Query Router (`RAGEngine._route_intent()`)
+### 5.1 Orchestration (`RAGEngine` — not a separate Mistral “router” tier)
 
-When a user asks a question, the raw text first passes to a fast classifier (`mistral-small-latest`). This model evaluates the intent of the question and looks for specific types of entities (like molecule or author names). It acts as a traffic cop, routing the question away from generic semantic searches towards optimized database queries.
+The live path is implemented in `rag_engine.py`: **local intent hints** (`_route_intent_local`), optional **LLM rewrites** for follow-ups and paper-discovery phrasing, **SciSpaCy NER** (and optional normalizer), then **one hybrid retrieval** call plus **PCC memory** in parallel. There is no distinct “small / medium / large” router in code — generation uses **Ollama** by default, with **OpenAI** only for deep intents when configured.
 
 ```mermaid
 flowchart TD
-    Q["User Question"] --> ROUTER["mistral-small-latest<br/>Classify query type & extract entities"]
-    ROUTER --> ROUTING{"Route by Intent"}
-    
-    ROUTING -->|themes / foundation| SQL["Aggregation / Metadata<br/>[e.g. Paper counts,<br/>most cited concepts]"] 
-    ROUTING -->|molecule / organism| GRAPH["Knowledge Graph DB<br/>[Chunks mentioning<br/>specific molecule nodes]"]
-    ROUTING -->|semantic query| VECTOR["Vector Semantic Store<br/>[Vector similarity<br/>over chunk concepts]"]
-
-    SQL --> MERGE["Merge Context Block +<br/>Abstain Evaluate"]
-    GRAPH --> MERGE
-    VECTOR --> MERGE
-
-    MERGE -->|Context missing?| REJECT["Abstain Response<br/>'I couldn't find an answer'"]
-    MERGE -->|Context present| GEN["LLM (mistral-large-latest)<br/>Answer ONLY from<br/>passed passages"]
-    
-    GEN --> FINAL["Streamed answer + Citation List"]
+    Q["User question"] --> OPT["Optional: author×gene graph answer\nNeo4j aggregation"]
+    OPT -->|shortcut| OUT["Answer + sources + memory_info"]
+    OPT -->|no shortcut| RW["LLM rewrites\nfollow-up · paper-discovery"]
+    RW --> NER["SciSpaCy + entities"]
+    NER --> PAR["Parallel:\nGraphStore.search · PCC context"]
+    PAR --> GATE{"Chunks + score vs\nRELEVANCE_THRESHOLD?"}
+    GATE -->|empty / strict gate| REF["Refusal message"]
+    GATE -->|ok or relaxed paths| GEN["Chat completion\nOllama · or OpenAI for deep intent"]
+    GEN --> OUT
+    REF --> OUT
 ```
 
-#### How Routing Assigns the "Table"
+**Intent flavors (examples):** `simple_lookup`, `entity_query`, `cross_paper_synthesis`, `topic_evolution`, `recommendation`, plus **paper-discovery** widening (`TOP_K_PAPER_DISCOVERY`) and **author×gene** analytics (`try_author_gene_graph_answer` / `get_authors_for_molecule`).
 
-Instead of blasting every question to a vector database, the router maps the user's intent to the most efficient specific lookup path:
+### 5.2 Hybrid retrieval & abstain
 
-*   **Relational / Aggregation Queries (`themes`, `foundational_papers`)**: Questions like *"What are the foundational papers?"* or *"What are the most mentioned topics?"*. Vector search is terrible at counting and filtering metadata. The router sends these to structured **Cypher queries** that `ORDER BY p.citations` or `COUNT()` rows.
-*   **Graph / Metadata Queries (`simple_lookup`)**: If the query is *"What did they discover about PTEN?"*, the router extracts the entity and performs a direct lookup in the Neo4j Knowledge Graph for chunks explicitly linked to the `[Molecule: PTEN]` node.
-*   **Semantic / Vector Queries (`topic_evolution`)**: If the question is broad, like *"How do cells regulate movement?"*, the router falls back to pure Semantic Vector Similarity against the chunks' text embeddings in the Neo4j Index.
+Retrieval is **`GraphStore.search`**: query embedding → **parallel** dense ANN and BM25 → merged candidates → **RRF** (k=60) → **entity-graph boost** on matching entity names → top-k. Gating uses `RELEVANCE_THRESHOLD` with **exceptions** for paper-discovery, rewritten follow-ups, and author×gene questions (see `rag_engine._prepare_query`). If no chunks pass, the engine returns the standard **refusal** string — not a separate SQL aggregation path for “themes.”
 
-### 5.2 Context Fusion & Abstain Checks
+### 5.3 Offline LLM evaluation (Judge)
 
-Once the specific path pulls its data, the contexts are accumulated. 
-1. **Named Entity Tracking** - SciSpaCy dynamically scores chunks referencing the user's target entities.
-2. **Neo4j Vector Similarity** - Cosine similarity via `all-mpnet-base-v2` against target embeddings.
-3. **Graph Hit Fusion** - A scoring multiplier is added to chunks intersecting on Neo4j edges.
+During batch runs, `evaluation/llm_judge.py` calls the **Ollama judge model** (same OpenAI-compatible client as chat) to score **Faithfulness** (answer vs retrieved context) and **Relevance** (answer vs question). This is **not** invoked by Streamlit or the API during normal chat.
 
-This data goes into a **"Merge Context + Abstain check"**. If the compiled context fails to relate to the user query, an automatic Abstain response (`"Couldn't find an answer within the corpus"`) guarantees zero hallucination.
-
-### 5.3 OpenAI Evaluation (Judge)
-During analytical batch workflows (`evaluate.py`, `llm_judge.py`), GraphRAG answers generated by Mistral are audited against independent benchmarks using `gpt-4o-mini`. 
-
-**Verdict Definition = (0.4 × Faithfulness) + (0.6 × Relevance)**
-If `Verdict >= 0.6`, the answer is scientifically reliable and contextually grounded.
+**Verdict Definition = (0.4 × Faithfulness) + (0.6 × Relevance)**  
+If `Verdict >= 0.6`, the run treats the answer as passing the scripted threshold.
 
 ---
 
 ## 6. Project File Structure
 
+*(Aligned with the `NovaAI_v2` repo — adjust drive/path for your machine.)*
+
 ```
-c:\Users\santosh Arsid\Desktop\Man Cave\Gen AI\Conv AI\HybdRAG_bot\
-├── build_index.py          # Batch ingestion + OCR + Graph push logic (warp-speed processing)
-├── chatbot.py              # Command-line interface / chat loop
-├── evaluate.py             # General benchmarker
-├── extract.py              # OCR, scispaCy NER, formatting
-├── graph_store.py          # Neo4j connections, constraints, Cypher ingestion blocks and search fns
-├── llm_judge.py            # Automated cross-model answer verifier using OpenAI
-├── rag_engine.py           # Core conversational class mapping queries -> search -> generate
-├── requirements.txt        # Full dependencies
-├── .env                    # Secret keys
+NovaAI_v2/
+├── api.py                  # FastAPI backend (REST, SSE, upload ingest)
+├── build_index.py          # Full batch ingestion → Neo4j
+├── chatbot.py              # CLI chat loop
+├── conversation_store.py # Neo4j-backed conversations for API
+├── extract.py              # PDF/OCR, chunking, SciSpaCy helpers
+├── graph_store.py          # Neo4j hybrid search, schema, ingest
+├── model_config.py         # Ollama URL, model names, optional OpenAI
+├── paper_ingest.py         # Incremental PDF ingest
+├── pcc_memory.py           # PCC short/long-term memory
+├── rag_engine.py           # Orchestration: rewrites → retrieval → generate
+├── web_search.py           # Web mode (DuckDuckGo + scrape + OpenAI)
+├── requirements.txt
+├── .env
+├── evaluation/
+│   ├── llm_judge.py        # Offline LLM-as-judge (faithfulness + relevance)
+│   ├── evaluate.py         # Benchmarks (if used)
+│   └── ragas_eval.py
+├── UI/
+│   └── streamlit_app.py    # Primary Streamlit UI
 ├── data/
-│   ├── chunks.json         # Raw text serialized storage
-│   ├── marker_output/      # Markdown representations from text OCR
-│   └── judge_results.json  # Output benchmarks
-└── ui/
-    └── streamlit_app.py    # Modern web-chat UI configuration
+│   ├── chunks.json
+│   └── ...
+└── docs/
+    ├── 01_system_architecture.md
+    └── graphrag_blueprint.md
 ```
 
 ---
 
 ## 7. Key Dependencies Highlights
 
-* `mistralai`: Core LLM powering reasoning, relationship graphs, and metadata generation.
-* `openai`: Serves as an independent audit/verdict platform to maintain objectivity. 
-* `sentence-transformers`: Local text embedding generation powered via GPU acceleration, radically reducing API costs per paper. 
-* `surya-ocr` & `torch`: High accuracy scanning pipelines. 
-* `scispacy`: Unsupervised localized tagging of specific bio-entities. 
+* `openai` (Python SDK): OpenAI-compatible client to **Ollama** (`OLLAMA_BASE_URL/v1`) for chat, rewrites, PCC, ingest; optional **OpenAI.com** for deep reasoning and web summarisation when keys are set.
+* `sentence-transformers`: Local embeddings (`NeuML/pubmedbert-base-embeddings`) for chunks and queries.
+* `neo4j`: Driver for graph + vector + fulltext queries.
+* `surya-ocr` & `torch`: OCR pipeline where needed for scanned PDFs.
+* `scispacy`: Biomedical NER for query and ingest entity extraction.
 
 ---
 
@@ -279,16 +293,16 @@ For the terminal application:
 python chatbot.py
 ```
 
-For the Streamlit server UI:
+For the Streamlit server UI (from repo root):
 ```powershell
-streamlit run ui/streamlit_app.py
+streamlit run UI/streamlit_app.py
 ```
 
-**5. Evaluate Quality**
+**5. Evaluate Quality (offline)**
 ```powershell
-python llm_judge.py
+python evaluation/llm_judge.py
 ```
-*(Runs an evaluation loop producing metric scorecards)*
+*(Runs the LLM-as-judge loop; outputs e.g. `data/judge_results.json` — see script defaults.)*
 
 ---
 
@@ -298,6 +312,7 @@ python llm_judge.py
 |:---|:---|
 | **Streamlit UI** | Streamlit Cloud (free), Google Cloud Run, or Azure Container Apps |
 | **Neo4j** | Neo4j AuraDB (free tier available) |
-| **OpenAI / Mistral API** | Keep as-is (external API) |
+| **Ollama (RunPod/local)** | Host for primary chat model; expose `OLLAMA_BASE_URL` |
+| **OpenAI API** | Optional: deep reasoning, web mode, or future judges — not required for basic corpus chat |
 | **GPU Models (Surya OCR, embeddings)** | Only needed for ingestion, not query time |
 | **scispaCy NER** | Runs CPU-only, lightweight |

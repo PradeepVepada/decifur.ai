@@ -29,6 +29,15 @@ from neo4j import GraphDatabase
 logger = logging.getLogger(__name__)
 
 
+def _title_from_first_message(content: str, max_len: int = 72) -> str:
+    t = " ".join((content or "").strip().split())
+    if not t:
+        return "Chat"
+    if len(t) <= max_len:
+        return t
+    return t[: max_len - 3] + "..."
+
+
 @dataclass
 class Message:
     role:        str
@@ -173,6 +182,14 @@ class ConversationStore:
                 SET c.message_count = c.message_count + 1,
                     c.updated_at    = datetime($now)
             """, conv_id=conversation_id, now=datetime.now().isoformat())
+
+            if message.role == "user" and count == 0:
+                new_title = _title_from_first_message(message.content)
+                session.run("""
+                    MATCH (c:Conversation {conversation_id: $conv_id})
+                    WHERE c.title STARTS WITH 'New Conversation' OR c.title = 'Untitled'
+                    SET c.title = $title, c.updated_at = datetime($now)
+                """, conv_id=conversation_id, title=new_title, now=datetime.now().isoformat())
 
     def get_conversation(self, conversation_id: str) -> Optional[Dict]:
         with self.driver.session() as session:

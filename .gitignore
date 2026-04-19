@@ -1,0 +1,92 @@
+# -------------------------
+# Python cache
+# -------------------------
+__pycache__/
+*.pyc
+
+# -------------------------
+# Virtual environments
+# -------------------------
+.venv/
+env/
+
+# -------------------------
+# Environment variables
+# -------------------------
+.env
+.env.local
+.env.*.local
+!.env.example
+!.env_sample
+
+# -------------------------
+# Data folders (KEEP /data)
+# -------------------------
+datasets/
+indexes/
+embeddings/
+outputs/
+logs/
+
+# -------------------------
+# Build artifacts
+# -------------------------
+build/
+dist/
+
+# -------------------------
+# Node / Next.js (UI)
+# -------------------------
+UI/node_modules/
+UI/.next/
+UI/out/
+node_modules/
+npm-debug.log*
+yarn-error.log*
+*.tsbuildinfo
+
+# -------------------------
+# Python tooling / tests
+# -------------------------
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+
+# -------------------------
+# VS Code
+# -------------------------
+.vscode/
+
+# -------------------------
+# System files
+# -------------------------
+.DS_Store
+Thumbs.db
+
+# -------------------------
+# Transient OCR / marker runs
+# -------------------------
+data/marker_output/tmp*/
+
+# -------------------------
+# Large auto-generated files
+# -------------------------
+*.log
+*.sqlite
+*.db
+*.bin
+*.pt
+*.pth
+*.h5
+
+# -------------------------
+# Editor / AI tool folders
+# -------------------------
+.claude/
+.cursor/
+
+# -------------------------
+# graphify (regenerate with: graphify update .)
+# -------------------------
+graphify-out/cache/
