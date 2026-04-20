@@ -3,6 +3,8 @@
 > **Conversational AI for interrogating the research corpus of Prof. Peter Devreotes (Johns Hopkins University)**  
 > **Domain:** Cell Biology → Signal Transduction & Chemotaxis  
 > **Approach:** Hybrid GraphRAG with Neo4j, SciSpaCy, Mistral AI, and Surya OCR
+> 
+<img width="595" height="148" alt="image" src="https://github.com/user-attachments/assets/0b1d7c9c-0e51-410a-8e28-df367f9c055b" />
 
 ---
 
