@@ -4,7 +4,8 @@
 > **Domain:** Cell Biology → Signal Transduction & Chemotaxis  
 > **Approach:** Hybrid GraphRAG with Neo4j, SciSpaCy, Mistral AI, and Surya OCR
 > 
-<img width="595" height="148" alt="image" src="https://github.com/user-attachments/assets/0b1d7c9c-0e51-410a-8e28-df367f9c055b" />
+<img width="949" height="366" alt="image" src="https://github.com/user-attachments/assets/18f3d119-2ee8-4cd0-b30d-327809a0cd75" />
+
 
 ---
 
