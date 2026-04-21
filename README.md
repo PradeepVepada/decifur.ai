@@ -57,7 +57,7 @@ NovaAI_v2/
 ├── interfaces/                    # User-facing interfaces
 │   ├── chatbot.py                 # CLI chatbot
 │   ├── ui/
-│   │   ├── streamlit_app.py       # Streamlit UI
+│   │   ├── streamlit_app.py       # Streamlit UI (Archived)
 │   │   ├── components/            # UI widgets, layouts
 │   │   └── assets/                # Images, CSS, JS
 │
