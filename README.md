@@ -19,8 +19,8 @@ pip install -r requirements.txt
 
 # 2. Ensure Neo4j Desktop is running
 
-# 3. Launch Streamlit UI (port 8506)
-.\.venv\Scripts\streamlit.exe run ui/streamlit_app.py --server.port 8506
+# 3. Launch backend FastAPI & frontend UI (port 3000)
+project directory path > run api.py & in a new terminal > npm run dev
 
 # 4. Or launch CLI chatbot
 .\.venv\Scripts\python.exe chatbot.py
@@ -119,7 +119,7 @@ NovaAI_v2/
 - **Tiered LLM Routing**: Cost-optimized query classification
 - **Biomedical NER**: SciSpaCy entity extraction
 - **GPU Acceleration**: Surya OCR and embeddings
-- **Makes use of Bioportal with SciSpacy for entity extraction and UMLS as fallback
+- **Makes use of Bioportal with SciSpacy for entity extraction and UMLS as fallback**
 
 ---
 
